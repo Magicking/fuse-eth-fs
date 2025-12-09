@@ -24,21 +24,17 @@ help:
 install:
 	@echo "Installing Python dependencies..."
 	pip install -r requirements.txt
-	@echo "Installing Node.js dependencies..."
-	npm install
+	@echo "Installing Forge dependencies..."
+	forge install
 	@echo "Installation complete!"
 
 compile:
 	@echo "Compiling smart contracts with Foundry..."
 	forge build
 
-node:
-	@echo "Starting Hardhat node..."
-	npx hardhat node
-
 deploy:
 	@echo "Deploying contracts..."
-	npx hardhat run scripts/deploy.js --network localhost
+	forge script Deploy.s.sol
 
 test: test-solidity test-python
 
