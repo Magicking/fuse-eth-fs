@@ -229,7 +229,13 @@ class EthFS(LoggingMixIn, Operations):
         return content[offset:offset + size]
     
     def write(self, path, data, offset, fh):
-        """Write to file"""
+        """
+        Write to file
+        
+        Note: Partial writes (offset > 0) are inefficient as they require reading
+        the entire file from the blockchain before writing. For production use,
+        consider implementing a caching layer or documenting this limitation.
+        """
         chain_id, account, rel_path = self._parse_path(path)
         
         if chain_id not in self.contract_managers or rel_path is None:
@@ -237,7 +243,11 @@ class EthFS(LoggingMixIn, Operations):
         
         contract_mgr = self.contract_managers[chain_id]
         
+        # Store the original data length for return value
+        bytes_to_write = len(data)
+        
         # Handle partial writes by reading existing content and merging
+        # WARNING: This is expensive as it reads the entire file from blockchain
         if offset != 0:
             entry = contract_mgr.get_entry(account, rel_path)
             if entry and entry[5]:
@@ -258,7 +268,8 @@ class EthFS(LoggingMixIn, Operations):
         else:
             contract_mgr.create_file(rel_path, data, account)
         
-        return len(data) if offset == 0 else len(data) - offset
+        # Return the number of bytes written (not the total file size)
+        return bytes_to_write
     
     def create(self, path, mode):
         """Create a new file"""

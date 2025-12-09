@@ -247,15 +247,16 @@ fuse-eth-fs/
 - **Performance**: Blockchain operations are slow; consider caching
 - **Gas Costs**: Every write operation costs gas
 - **File Size**: Large files are expensive to store on-chain
-- **Partial Writes**: Currently limited support for partial file writes
+- **Partial Writes**: Writes with offset > 0 are inefficient as they require reading the entire file from the blockchain before writing. This is expensive in terms of gas and network calls.
 - **Permissions**: Basic permission system (owner-based)
 
 Future improvements could include:
 - IPFS integration for large file storage
-- Advanced caching mechanisms
-- Multiple account support
+- Advanced caching mechanisms to reduce blockchain reads
+- Write buffering to minimize transaction costs
+- Multiple account support with shared access
 - Enhanced permission system
-- Transaction batching
+- Transaction batching for bulk operations
 
 ## Contributing
 
