@@ -97,6 +97,16 @@ contract FileSystem {
         
         delete entries[msg.sender][path];
         
+        // Remove path from accountPaths array
+        string[] storage paths = accountPaths[msg.sender];
+        for (uint i = 0; i < paths.length; i++) {
+            if (keccak256(bytes(paths[i])) == keccak256(bytes(path))) {
+                paths[i] = paths[paths.length - 1];
+                paths.pop();
+                break;
+            }
+        }
+        
         emit EntryDeleted(msg.sender, path);
     }
     

@@ -237,15 +237,20 @@ class EthFS(LoggingMixIn, Operations):
         
         contract_mgr = self.contract_managers[chain_id]
         
-        # For simplicity, we don't support partial writes (offset must be 0)
-        # In a production system, you'd need to handle this properly
+        # Handle partial writes by reading existing content and merging
         if offset != 0:
-            # Read existing content and merge
             entry = contract_mgr.get_entry(account, rel_path)
             if entry and entry[5]:
                 existing = bytearray(entry[3])
+                # Extend the buffer if offset is beyond current length
+                if offset + len(data) > len(existing):
+                    existing.extend(b'\0' * (offset + len(data) - len(existing)))
+                # Write data at the specified offset
                 existing[offset:offset + len(data)] = data
                 data = bytes(existing)
+            else:
+                # File doesn't exist, create with padding
+                data = b'\0' * offset + data
         
         # Update the file
         if contract_mgr.exists(account, rel_path):
@@ -253,7 +258,7 @@ class EthFS(LoggingMixIn, Operations):
         else:
             contract_mgr.create_file(rel_path, data, account)
         
-        return len(data)
+        return len(data) if offset == 0 else len(data) - offset
     
     def create(self, path, mode):
         """Create a new file"""

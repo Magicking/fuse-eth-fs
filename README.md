@@ -169,38 +169,77 @@ The smart contract provides:
 ### Compile Smart Contracts
 
 ```bash
+# Using Foundry
+forge build
+
+# Or using Hardhat (legacy)
 npx hardhat compile
 ```
 
 ### Run Tests
 
-```bash
-# Solidity tests (if added)
-npx hardhat test
+The project includes comprehensive tests for both Solidity and Python components:
 
-# Python tests (if added)
-pytest
+```bash
+# Run all tests
+make test
+
+# Run only Solidity tests (using Foundry)
+make test-solidity
+# Or directly:
+forge test -vv
+
+# Run only Python tests
+make test-python
+# Or directly:
+python -m pytest test/python/ -v
 ```
+
+#### Solidity Tests
+
+Solidity tests are written using Foundry's testing framework and are located in `test/solidity/`. These tests verify:
+- File and directory creation
+- Update and delete operations
+- Access control and permissions
+- Path listing functionality
+- Multi-account isolation
+
+#### Python Tests
+
+Python tests use pytest and are located in `test/python/`. These tests verify:
+- RPC connection management
+- Path parsing logic
+- Contract interaction layer
+- Multi-chain support
 
 ### Project Structure
 
 ```
 fuse-eth-fs/
-├── contracts/           # Solidity smart contracts
+├── contracts/              # Solidity smart contracts
 │   └── FileSystem.sol
-├── fuse_eth_fs/        # Python FUSE implementation
+├── fuse_eth_fs/           # Python FUSE implementation
 │   ├── __init__.py
-│   ├── main.py         # Entry point
-│   ├── filesystem.py   # FUSE filesystem class
-│   ├── rpc_manager.py  # RPC connection manager
-│   └── contract_manager.py  # Smart contract interface
-├── scripts/            # Deployment scripts
+│   ├── main.py            # Entry point
+│   ├── filesystem.py      # FUSE filesystem class
+│   ├── rpc_manager.py     # RPC connection manager
+│   └── contract_manager.py # Smart contract interface
+├── test/                  # Test files
+│   ├── solidity/          # Foundry tests
+│   │   └── FileSystem.t.sol
+│   └── python/            # Python unit tests
+│       ├── test_rpc_manager.py
+│       ├── test_filesystem.py
+│       └── test_contract_manager.py
+├── scripts/               # Deployment scripts
 │   └── deploy.js
-├── hardhat.config.js   # Hardhat configuration
-├── package.json        # Node.js dependencies
-├── requirements.txt    # Python dependencies
-├── setup.py           # Python package setup
-└── README.md          # This file
+├── foundry.toml          # Foundry configuration
+├── hardhat.config.js     # Hardhat configuration (for deployment)
+├── package.json          # Node.js dependencies
+├── requirements.txt      # Python dependencies
+├── setup.py             # Python package setup
+├── Makefile             # Common development tasks
+└── README.md            # This file
 ```
 
 ## Limitations & Future Improvements

@@ -2,9 +2,12 @@
 Contract Manager for interacting with the FileSystem smart contract
 """
 import json
+import logging
 from typing import Optional, List, Tuple
 from web3 import Web3
 from web3.contract import Contract
+
+logger = logging.getLogger(__name__)
 
 
 class ContractManager:
@@ -97,9 +100,10 @@ class ContractManager:
         try:
             tx_hash = self.contract.functions.createFile(path, content).transact({'from': account})
             self.w3.eth.wait_for_transaction_receipt(tx_hash)
+            logger.info(f"Created file '{path}' for account {account}")
             return True
         except Exception as e:
-            print(f"Error creating file: {e}")
+            logger.error(f"Error creating file '{path}' for account {account}: {e}")
             return False
     
     def create_directory(self, path: str, account: str) -> bool:
@@ -107,9 +111,10 @@ class ContractManager:
         try:
             tx_hash = self.contract.functions.createDirectory(path).transact({'from': account})
             self.w3.eth.wait_for_transaction_receipt(tx_hash)
+            logger.info(f"Created directory '{path}' for account {account}")
             return True
         except Exception as e:
-            print(f"Error creating directory: {e}")
+            logger.error(f"Error creating directory '{path}' for account {account}: {e}")
             return False
     
     def update_file(self, path: str, content: bytes, account: str) -> bool:
@@ -117,9 +122,10 @@ class ContractManager:
         try:
             tx_hash = self.contract.functions.updateFile(path, content).transact({'from': account})
             self.w3.eth.wait_for_transaction_receipt(tx_hash)
+            logger.info(f"Updated file '{path}' for account {account}")
             return True
         except Exception as e:
-            print(f"Error updating file: {e}")
+            logger.error(f"Error updating file '{path}' for account {account}: {e}")
             return False
     
     def delete_entry(self, path: str, account: str) -> bool:
@@ -127,9 +133,10 @@ class ContractManager:
         try:
             tx_hash = self.contract.functions.deleteEntry(path).transact({'from': account})
             self.w3.eth.wait_for_transaction_receipt(tx_hash)
+            logger.info(f"Deleted entry '{path}' for account {account}")
             return True
         except Exception as e:
-            print(f"Error deleting entry: {e}")
+            logger.error(f"Error deleting entry '{path}' for account {account}: {e}")
             return False
     
     def get_entry(self, account: str, path: str) -> Optional[Tuple]:
@@ -137,7 +144,7 @@ class ContractManager:
         try:
             return self.contract.functions.getEntry(account, path).call()
         except Exception as e:
-            print(f"Error getting entry: {e}")
+            logger.debug(f"Error getting entry '{path}' for account {account}: {e}")
             return None
     
     def get_account_paths(self, account: str) -> List[str]:
@@ -145,7 +152,7 @@ class ContractManager:
         try:
             return self.contract.functions.getAccountPaths(account).call()
         except Exception as e:
-            print(f"Error getting account paths: {e}")
+            logger.error(f"Error getting account paths for {account}: {e}")
             return []
     
     def exists(self, account: str, path: str) -> bool:
@@ -153,5 +160,5 @@ class ContractManager:
         try:
             return self.contract.functions.exists(account, path).call()
         except Exception as e:
-            print(f"Error checking existence: {e}")
+            logger.debug(f"Error checking existence of '{path}' for account {account}: {e}")
             return False

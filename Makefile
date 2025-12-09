@@ -1,16 +1,18 @@
-.PHONY: install compile deploy test clean mount help
+.PHONY: install compile deploy test test-solidity test-python clean mount help
 
 help:
 	@echo "fuse-eth-fs - Makefile commands"
 	@echo ""
 	@echo "Setup:"
 	@echo "  make install       - Install all dependencies"
-	@echo "  make compile       - Compile smart contracts"
+	@echo "  make compile       - Compile smart contracts with Foundry"
 	@echo ""
 	@echo "Development:"
 	@echo "  make node          - Start local Hardhat node"
 	@echo "  make deploy        - Deploy contracts to local network"
-	@echo "  make test          - Run smart contract tests"
+	@echo "  make test          - Run all tests (Solidity + Python)"
+	@echo "  make test-solidity - Run Solidity tests with Foundry"
+	@echo "  make test-python   - Run Python unit tests"
 	@echo ""
 	@echo "Usage:"
 	@echo "  make mount         - Mount filesystem (needs deployment first)"
@@ -27,8 +29,8 @@ install:
 	@echo "Installation complete!"
 
 compile:
-	@echo "Compiling smart contracts..."
-	npx hardhat compile
+	@echo "Compiling smart contracts with Foundry..."
+	forge build
 
 node:
 	@echo "Starting Hardhat node..."
@@ -38,9 +40,15 @@ deploy:
 	@echo "Deploying contracts..."
 	npx hardhat run scripts/deploy.js --network localhost
 
-test:
-	@echo "Running smart contract tests..."
-	npx hardhat test
+test: test-solidity test-python
+
+test-solidity:
+	@echo "Running Solidity tests with Foundry..."
+	forge test -vv
+
+test-python:
+	@echo "Running Python unit tests..."
+	python -m pytest test/python/ -v
 
 mount:
 	@echo "Creating mount point..."
@@ -60,5 +68,7 @@ clean:
 	@echo "Cleaning build artifacts..."
 	rm -rf cache/ artifacts/ node_modules/ __pycache__/ 
 	rm -rf fuse_eth_fs/__pycache__/ *.egg-info/ build/ dist/
+	rm -rf out/ cache_forge/ lib/
+	rm -rf test/python/__pycache__/
 	rm -f deployment.json
 	@echo "Clean complete!"

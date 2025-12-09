@@ -38,6 +38,11 @@ artifacts/
 typechain/
 typechain-types/
 
+# Foundry
+out/
+cache_forge/
+lib/
+
 # Coverage
 .coverage
 htmlcov/
@@ -57,3 +62,6 @@ Thumbs.db
 # Environment variables
 .env
 .env.local
+
+# Deployment
+deployment.json
