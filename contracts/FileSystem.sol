@@ -5,304 +5,543 @@ import "./IFileSystem.sol";
 
 /**
  * @title FileSystem
- * @dev Basic filesystem contract for storing files and directories
+ * @dev VFAT-like filesystem contract with packed storage accessed via Yul assembly
+ * Data is stored in clusters (32-byte chunks) at specific storage slots
+ * Entry metadata is packed into uint256 values for efficiency
+ * All storage access uses Yul assembly (sload/sstore) for direct slot manipulation
  */
 contract FileSystem is IFileSystem {
-    // Mapping from account address -> path -> Entry
-    mapping(address => mapping(string => Entry)) private entries;
+    // Storage layout:
+    // - Entry metadata: stored at storageSlot (packed uint256)
+    // - Directory target: stored at storageSlot + 1 (if directory)
+    // - File clusters: stored at storageSlot + 2 + clusterIndex
+    // - Entry enumeration: mapping to track which slots are used
     
-    // Mapping from account address -> list of paths (for enumeration)
-    mapping(address => string[]) private accountPaths;
+    // Base storage slot for entry metadata mapping
+    // mapping(uint256 => uint256) entryMetadata; // slot 0
+    // mapping(uint256 => address) directoryTargets; // slot 1
+    // mapping(uint256 => mapping(uint256 => uint256)) fileClusters; // slot 2
+    // uint256[] entrySlots; // slot 3
     
-    // Global registry: keccak256(path, owner) -> exists (to check if file exists for any account)
-    mapping(bytes32 => bool) private globalPathOwners;
+    // Constants for packing/unpacking metadata
+    // Layout: owner (160 bits, bits 96-255) | entryType (1 bit, bit 95) | exists (1 bit, bit 94) | timestamp (64 bits, bits 30-93) | fileSize (30 bits, bits 0-29)
+    uint256 private constant MASK_OWNER = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF000000000000000000000000;
+    uint256 private constant MASK_ENTRY_TYPE = 0x0000000000000000000000000000000000000000800000000000000000000000;
+    uint256 private constant MASK_EXISTS = 0x0000000000000000000000000000000000000000400000000000000000000000;
+    uint256 private constant MASK_TIMESTAMP = 0x00000000000000000000000000000000000000003FFFFFFFFFFFFFFFC0000000;
+    uint256 private constant MASK_FILE_SIZE = 0x000000000000000000000000000000000000000000000000000000003FFFFFFF;
     
-    // Set of all paths that exist (to quickly check if path exists for any account)
-    mapping(string => bool) private globalPaths;
+    // Storage slot offsets
+    uint256 private constant SLOT_ENTRY_METADATA = 0;
+    uint256 private constant SLOT_DIRECTORY_TARGETS = 1;
+    uint256 private constant SLOT_FILE_CLUSTERS = 2;
+    uint256 private constant SLOT_ENTRY_SLOTS = 3;
     
     /**
-     * @dev Create a new file
-     * @param path The path of the file
-     * @param content The content of the file
+     * @dev Get storage slot for entry metadata
      */
-    function createFile(string memory path, bytes memory content) public override {
-        require(!entries[msg.sender][path].exists, "Entry already exists");
-        
-        entries[msg.sender][path] = Entry({
-            name: path,
-            entryType: EntryType.FILE,
-            owner: msg.sender,
-            content: content,
-            timestamp: block.timestamp,
-            exists: true
-        });
-        
-        accountPaths[msg.sender].push(path);
-        bytes32 key = keccak256(abi.encodePacked(path, msg.sender));
-        globalPathOwners[key] = true;
-        globalPaths[path] = true;
-        
-        emit FileCreated(msg.sender, path, block.timestamp);
+    function _getMetadataSlot(uint256 storageSlot) private pure returns (uint256) {
+        // mapping(uint256 => uint256) entryMetadata; // slot 0
+        // slot = keccak256(abi.encodePacked(storageSlot, SLOT_ENTRY_METADATA))
+        return uint256(keccak256(abi.encodePacked(storageSlot, SLOT_ENTRY_METADATA)));
     }
     
     /**
-     * @dev Create a new directory
-     * @param path The path of the directory
+     * @dev Get storage slot for directory target
      */
-    function createDirectory(string memory path) public override {
-        require(!entries[msg.sender][path].exists, "Entry already exists");
-        
-        entries[msg.sender][path] = Entry({
-            name: path,
-            entryType: EntryType.DIRECTORY,
-            owner: msg.sender,
-            content: new bytes(0),
-            timestamp: block.timestamp,
-            exists: true
-        });
-        
-        accountPaths[msg.sender].push(path);
-        bytes32 key = keccak256(abi.encodePacked(path, msg.sender));
-        globalPathOwners[key] = true;
-        globalPaths[path] = true;
-        
-        emit DirectoryCreated(msg.sender, path, block.timestamp);
+    function _getDirectoryTargetSlot(uint256 storageSlot) private pure returns (uint256) {
+        // mapping(uint256 => address) directoryTargets; // slot 1
+        return uint256(keccak256(abi.encodePacked(storageSlot, SLOT_DIRECTORY_TARGETS)));
     }
     
     /**
-     * @dev Update file content
-     * @param path The path of the file
-     * @param content The new content of the file
+     * @dev Get storage slot for file cluster
      */
-    function updateFile(string memory path, bytes memory content) public override {
-        Entry storage entry = entries[msg.sender][path];
-        if (!entry.exists) {
-            // Check if path exists globally for any account
-            if (globalPaths[path]) {
-                // Path exists for someone else, but not for caller
-                revert("Not owner");
-            }
-            // Path doesn't exist for anyone
-            revert("Entry does not exist");
+    function _getClusterSlot(uint256 storageSlot, uint256 clusterIndex) private pure returns (uint256) {
+        // mapping(uint256 => mapping(uint256 => uint256)) fileClusters; // slot 2
+        // First mapping: keccak256(abi.encodePacked(storageSlot, SLOT_FILE_CLUSTERS))
+        uint256 firstMappingSlot = uint256(keccak256(abi.encodePacked(storageSlot, SLOT_FILE_CLUSTERS)));
+        // Second mapping: keccak256(abi.encodePacked(clusterIndex, firstMappingSlot))
+        return uint256(keccak256(abi.encodePacked(clusterIndex, firstMappingSlot)));
+    }
+    
+    /**
+     * @dev Load value from storage slot using Yul
+     */
+    function _sload(uint256 slot) private view returns (uint256 value) {
+        assembly {
+            value := sload(slot)
         }
-        require(entry.owner == msg.sender, "Not owner");
-        require(entry.entryType == EntryType.FILE, "Not a file");
-        
-        entries[msg.sender][path].content = content;
-        entries[msg.sender][path].timestamp = block.timestamp;
-        
-        emit FileUpdated(msg.sender, path, block.timestamp);
     }
     
     /**
-     * @dev Delete an entry (file or directory)
-     * @param path The path of the entry to delete
+     * @dev Store value to storage slot using Yul
      */
-    function deleteEntry(string memory path) public override {
-        Entry storage entry = entries[msg.sender][path];
-        bytes32 key = keccak256(abi.encodePacked(path, msg.sender));
-        
-        if (!entry.exists) {
-            // Check if path exists globally for any account
-            if (globalPaths[path]) {
-                // Path exists for someone else, but not for caller
-                revert("Not owner");
-            }
-            // Path doesn't exist for anyone
-            revert("Entry does not exist");
+    function _sstore(uint256 slot, uint256 value) private {
+        assembly {
+            sstore(slot, value)
         }
-        require(entry.owner == msg.sender, "Not owner");
-        
-        delete entries[msg.sender][path];
-        globalPathOwners[key] = false;
-        
-        // Check if path still exists for any other account
-        // Since we can't iterate, we'll keep globalPaths[path] = true
-        // It will be cleaned up when the last owner deletes it
-        // For now, we'll leave it as is to avoid complexity
-        
-        // Remove path from accountPaths array
-        string[] storage paths = accountPaths[msg.sender];
-        for (uint i = 0; i < paths.length; i++) {
-            if (keccak256(bytes(paths[i])) == keccak256(bytes(path))) {
-                paths[i] = paths[paths.length - 1];
-                paths.pop();
-                break;
-            }
+    }
+    
+    /**
+     * @dev Pack entry metadata into uint256
+     * Layout: owner (160 bits) | entryType (1 bit) | exists (1 bit) | timestamp (64 bits) | fileSize (30 bits)
+     */
+    function _packMetadata(
+        address owner,
+        EntryType entryType,
+        bool existsFlag,
+        uint64 timestamp,
+        uint32 fileSize
+    ) private pure returns (uint256) {
+        uint256 packed = 0;
+        // Owner: bits 96-255 (160 bits)
+        packed |= uint256(uint160(owner)) << 96;
+        // EntryType: bit 95
+        if (entryType == EntryType.DIRECTORY) {
+            packed |= uint256(1) << 95;
         }
+        // Exists: bit 94
+        if (existsFlag) {
+            packed |= uint256(1) << 94;
+        }
+        // Timestamp: bits 30-93 (64 bits)
+        packed |= uint256(timestamp) << 30;
+        // FileSize: bits 0-29 (30 bits, max ~1GB)
+        packed |= uint256(fileSize) & 0x3FFFFFFF;
+        return packed;
+    }
+    
+    /**
+     * @dev Unpack entry metadata from uint256
+     */
+    function _unpackMetadata(uint256 packed) private pure returns (
+        address owner,
+        EntryType entryType,
+        bool existsFlag,
+        uint64 timestamp,
+        uint32 fileSize
+    ) {
+        // Owner: bits 96-255
+        owner = address(uint160(packed >> 96));
+        // EntryType: bit 95
+        entryType = (packed & MASK_ENTRY_TYPE) != 0 ? EntryType.DIRECTORY : EntryType.FILE;
+        // Exists: bit 94
+        existsFlag = (packed & MASK_EXISTS) != 0;
+        // Timestamp: bits 30-93
+        timestamp = uint64((packed & MASK_TIMESTAMP) >> 30);
+        // FileSize: bits 0-29
+        fileSize = uint32(packed & MASK_FILE_SIZE);
+    }
+    
+    /**
+     * @dev Get cluster index from byte offset
+     */
+    function _getClusterIndex(uint256 byteOffset) private pure returns (uint256) {
+        return byteOffset / 32;
+    }
+    
+    /**
+     * @dev Get byte offset within cluster
+     */
+    function _getClusterOffset(uint256 byteOffset) private pure returns (uint256) {
+        return byteOffset % 32;
+    }
+    
+    /**
+     * @dev Write bytes to clusters starting at offset using Yul storage access
+     */
+    function _writeToClusters(
+        uint256 storageSlot,
+        bytes memory content,
+        uint256 offset
+    ) private {
+        if (content.length == 0) return;
         
-        emit EntryDeleted(msg.sender, path);
-    }
-    
-    /**
-     * @dev Get entry information
-     * @param account The account address
-     * @param path The path of the entry
-     * @return name The name of the entry
-     * @return entryType The type of the entry (FILE or DIRECTORY)
-     * @return owner The owner of the entry
-     * @return content The content (for files)
-     * @return timestamp The last modification timestamp
-     * @return entryExists Whether the entry exists
-     */
-    function getEntry(address account, string memory path) 
-        public 
-        view 
-        override
-        returns (
-            string memory name,
-            EntryType entryType,
-            address owner,
-            bytes memory content,
-            uint256 timestamp,
-            bool entryExists
-        ) 
-    {
-        Entry memory entry = entries[account][path];
-        return (
-            entry.name,
-            entry.entryType,
-            entry.owner,
-            entry.content,
-            entry.timestamp,
-            entry.exists
-        );
-    }
-    
-    /**
-     * @dev Get all paths for an account
-     * @param account The account address
-     * @return An array of all paths owned by the account
-     */
-    function getAccountPaths(address account) public view override returns (string[] memory) {
-        return accountPaths[account];
-    }
-    
-    /**
-     * @dev Check if an entry exists
-     * @param account The account address
-     * @param path The path to check
-     * @return Whether the entry exists
-     */
-    function exists(address account, string memory path) public view override returns (bool) {
-        return entries[account][path].exists;
-    }
-    
-    /**
-     * @dev Read file content at a specific offset
-     * @param account The account address
-     * @param path The path of the file
-     * @param offset The byte offset to start reading from
-     * @param length The number of bytes to read (0 means read to end)
-     * @return content The content bytes at the specified offset
-     */
-    function readFile(address account, string memory path, uint256 offset, uint256 length) 
-        public 
-        view 
-        override
-        returns (bytes memory content) 
-    {
-        Entry memory entry = entries[account][path];
-        require(entry.exists, "Entry does not exist");
-        require(entry.entryType == EntryType.FILE, "Not a file");
+        uint256 contentLength = content.length;
+        uint256 endOffset = offset + contentLength;
+        uint256 startCluster = _getClusterIndex(offset);
+        uint256 endCluster = _getClusterIndex(endOffset - 1) + 1;
+        uint256 clusterOffset = _getClusterOffset(offset);
+        uint256 contentIndex = 0;
         
-        bytes memory fileContent = entry.content;
-        
-        // If offset is beyond file length, return empty bytes
-        if (offset >= fileContent.length) {
+        for (uint256 clusterIdx = startCluster; clusterIdx < endCluster; clusterIdx++) {
+            uint256 clusterSlot = _getClusterSlot(storageSlot, clusterIdx);
+            uint256 clusterData = _sload(clusterSlot);
+            
+            // Calculate how many bytes to write in this cluster
+            uint256 bytesInCluster = 32 - clusterOffset;
+            if (contentIndex + bytesInCluster > contentLength) {
+                bytesInCluster = contentLength - contentIndex;
+            }
+            
+            // Write bytes to cluster (big-endian: first byte at MSB)
+            for (uint256 i = 0; i < bytesInCluster; i++) {
+                uint256 bytePos = clusterOffset + i;
+                uint256 shift = (31 - bytePos) * 8;
+                // Clear the byte position
+                clusterData &= ~(uint256(0xFF) << shift);
+                // Set the byte
+                clusterData |= uint256(uint8(content[contentIndex + i])) << shift;
+            }
+            
+            _sstore(clusterSlot, clusterData);
+            contentIndex += bytesInCluster;
+            clusterOffset = 0; // Reset for subsequent clusters
+        }
+    }
+    
+    /**
+     * @dev Read bytes from clusters starting at offset using Yul storage access
+     */
+    function _readFromClusters(
+        uint256 storageSlot,
+        uint256 offset,
+        uint256 length,
+        uint32 fileSize
+    ) private view returns (bytes memory) {
+        if (offset >= fileSize) {
             return new bytes(0);
         }
         
-        // Calculate actual length to read
         uint256 actualLength = length;
-        if (length == 0 || offset + length > fileContent.length) {
-            actualLength = fileContent.length - offset;
+        if (length == 0 || offset + length > fileSize) {
+            actualLength = fileSize - offset;
         }
         
-        // Extract the slice
         bytes memory result = new bytes(actualLength);
-        for (uint256 i = 0; i < actualLength; i++) {
-            result[i] = fileContent[offset + i];
+        uint256 startCluster = _getClusterIndex(offset);
+        uint256 endCluster = _getClusterIndex(offset + actualLength - 1) + 1;
+        uint256 clusterOffset = _getClusterOffset(offset);
+        uint256 resultIndex = 0;
+        
+        for (uint256 clusterIdx = startCluster; clusterIdx < endCluster; clusterIdx++) {
+            uint256 clusterSlot = _getClusterSlot(storageSlot, clusterIdx);
+            uint256 clusterData = _sload(clusterSlot);
+            
+            uint256 bytesInCluster = 32 - clusterOffset;
+            if (resultIndex + bytesInCluster > actualLength) {
+                bytesInCluster = actualLength - resultIndex;
+            }
+            
+            for (uint256 i = 0; i < bytesInCluster; i++) {
+                uint256 bytePos = clusterOffset + i;
+                uint256 shift = (31 - bytePos) * 8;
+                result[resultIndex + i] = bytes1(uint8((clusterData >> shift) & 0xFF));
+            }
+            
+            resultIndex += bytesInCluster;
+            clusterOffset = 0;
         }
         
         return result;
     }
     
     /**
-     * @dev Write file content at a specific offset
-     * @param path The path of the file
-     * @param offset The byte offset to start writing at
-     * @param content The content bytes to write
+     * @dev Create a new file with optional offset at a specific storage slot
      */
-    function writeFile(string memory path, uint256 offset, bytes memory content) public override {
-        Entry storage entry = entries[msg.sender][path];
+    function createFile(uint256 storageSlot, bytes memory content, uint256 offset) public override {
+        uint256 metadataSlot = _getMetadataSlot(storageSlot);
+        uint256 packed = _sload(metadataSlot);
+        (,, bool existsFlag,,) = _unpackMetadata(packed);
+        require(!existsFlag, "Entry already exists");
         
-        if (!entry.exists) {
-            // Check if path exists globally for any account
-            if (globalPaths[path]) {
-                // Path exists for someone else, but not for caller
-                revert("Not owner");
-            }
-            // Path doesn't exist for anyone - create new file
-            // If offset > 0, pad with zeros (bytes arrays are initialized with zeros by default)
-            bytes memory fullContent = new bytes(offset + content.length);
-            
-            // Write content at offset (padding is already zeros)
-            for (uint256 i = 0; i < content.length; i++) {
-                fullContent[offset + i] = content[i];
-            }
-            
-            entries[msg.sender][path] = Entry({
-                name: path,
-                entryType: EntryType.FILE,
-                owner: msg.sender,
-                content: fullContent,
-                timestamp: block.timestamp,
-                exists: true
-            });
-            
-            accountPaths[msg.sender].push(path);
-            bytes32 key = keccak256(abi.encodePacked(path, msg.sender));
-            globalPathOwners[key] = true;
-            globalPaths[path] = true;
-            
-            emit FileCreated(msg.sender, path, block.timestamp);
+        uint256 fileSize = offset + content.length;
+        require(fileSize <= type(uint32).max, "File too large");
+        
+        _writeToClusters(storageSlot, content, offset);
+        
+        uint256 newPacked = _packMetadata(
+            msg.sender,
+            EntryType.FILE,
+            true,
+            uint64(block.timestamp),
+            uint32(fileSize)
+        );
+        _sstore(metadataSlot, newPacked);
+        
+        // Add to entry slots list
+        _addEntrySlot(storageSlot);
+        
+        emit FileCreated(msg.sender, storageSlot, block.timestamp, offset);
+    }
+    
+    /**
+     * @dev Create a new directory pointing to another IFileSystem contract at a specific storage slot
+     */
+    function createDirectory(uint256 storageSlot, address target) public override {
+        require(target != address(0), "Invalid target address");
+        require(target != address(this), "Cannot point to self");
+        
+        uint256 metadataSlot = _getMetadataSlot(storageSlot);
+        uint256 packed = _sload(metadataSlot);
+        (,, bool existsFlag,,) = _unpackMetadata(packed);
+        require(!existsFlag, "Entry already exists");
+        
+        uint256 newPacked = _packMetadata(
+            msg.sender,
+            EntryType.DIRECTORY,
+            true,
+            uint64(block.timestamp),
+            0
+        );
+        _sstore(metadataSlot, newPacked);
+        
+        // Store directory target
+        uint256 targetSlot = _getDirectoryTargetSlot(storageSlot);
+        _sstore(targetSlot, uint256(uint160(target)));
+        
+        // Add to entry slots list
+        _addEntrySlot(storageSlot);
+        
+        emit DirectoryCreated(msg.sender, storageSlot, target, block.timestamp);
+    }
+    
+    /**
+     * @dev Update file content at a specific offset
+     */
+    function updateFile(uint256 storageSlot, bytes memory content, uint256 offset) public override {
+        uint256 metadataSlot = _getMetadataSlot(storageSlot);
+        uint256 packed = _sload(metadataSlot);
+        (address owner, EntryType entryType, bool existsFlag, uint64 timestamp, uint32 currentSize) = _unpackMetadata(packed);
+        
+        if (!existsFlag) {
+            revert("Entry does not exist");
+        }
+        require(owner == msg.sender, "Not owner");
+        require(entryType == EntryType.FILE, "Not a file");
+        
+        uint256 newSize = offset + content.length;
+        if (newSize > currentSize) {
+            // Extending the file
+            newSize = newSize > type(uint32).max ? type(uint32).max : newSize;
+        } else if (offset == 0 && content.length < currentSize) {
+            // Writing from start with shorter content - truncate to new size
+            newSize = content.length;
+        } else {
+            // Writing in the middle or at end - keep current size to preserve data
+            newSize = currentSize;
+        }
+        
+        _writeToClusters(storageSlot, content, offset);
+        
+        uint256 newPacked = _packMetadata(
+            msg.sender,
+            EntryType.FILE,
+            true,
+            uint64(block.timestamp),
+            uint32(newSize)
+        );
+        _sstore(metadataSlot, newPacked);
+        
+        emit FileUpdated(msg.sender, storageSlot, block.timestamp, offset);
+    }
+    
+    /**
+     * @dev Delete an entry (file or directory)
+     */
+    function deleteEntry(uint256 storageSlot) public override {
+        uint256 metadataSlot = _getMetadataSlot(storageSlot);
+        uint256 packed = _sload(metadataSlot);
+        (address owner, , bool existsFlag, , ) = _unpackMetadata(packed);
+        
+        if (!existsFlag) {
+            revert("Entry does not exist");
+        }
+        require(owner == msg.sender, "Not owner");
+        
+        // Clear metadata
+        _sstore(metadataSlot, 0);
+        
+        // Clear directory target if it's a directory
+        uint256 targetSlot = _getDirectoryTargetSlot(storageSlot);
+        if (_sload(targetSlot) != 0) {
+            _sstore(targetSlot, 0);
+        }
+        
+        // Remove from entry slots list
+        _removeEntrySlot(storageSlot);
+        
+        emit EntryDeleted(msg.sender, storageSlot);
+    }
+    
+    /**
+     * @dev Get entry information at a specific storage slot
+     */
+    function getEntry(uint256 storageSlot) 
+        public 
+        view 
+        override
+        returns (
+            EntryType entryType,
+            address owner,
+            bytes memory content,
+            uint256 timestamp,
+            bool entryExists,
+            uint256 fileSize,
+            address directoryTarget
+        ) 
+    {
+        uint256 metadataSlot = _getMetadataSlot(storageSlot);
+        uint256 packed = _sload(metadataSlot);
+        (owner, entryType, entryExists, timestamp, fileSize) = _unpackMetadata(packed);
+        
+        // Get directory target if it's a directory
+        if (entryExists && entryType == EntryType.DIRECTORY) {
+            uint256 targetSlot = _getDirectoryTargetSlot(storageSlot);
+            directoryTarget = address(uint160(_sload(targetSlot)));
+        }
+        
+        // Reconstruct content from clusters if it's a file
+        if (entryExists && entryType == EntryType.FILE) {
+            content = _readFromClusters(storageSlot, 0, 0, uint32(fileSize));
+        } else {
+            content = new bytes(0);
+        }
+    }
+    
+    /**
+     * @dev Get all storage slots that have entries in this filesystem
+     */
+    function getEntries() public view override returns (uint256[] memory) {
+        return _getEntrySlots();
+    }
+    
+    /**
+     * @dev Check if an entry exists at a specific storage slot
+     */
+    function exists(uint256 storageSlot) public view override returns (bool) {
+        uint256 metadataSlot = _getMetadataSlot(storageSlot);
+        uint256 packed = _sload(metadataSlot);
+        (,, bool existsFlag,,) = _unpackMetadata(packed);
+        return existsFlag;
+    }
+    
+    /**
+     * @dev Read file content at a specific offset
+     */
+    function readFile(uint256 storageSlot, uint256 offset, uint256 length) 
+        public 
+        view 
+        override
+        returns (bytes memory content) 
+    {
+        uint256 metadataSlot = _getMetadataSlot(storageSlot);
+        uint256 packed = _sload(metadataSlot);
+        (, EntryType entryType, bool existsFlag, , uint32 fileSize) = _unpackMetadata(packed);
+        
+        require(existsFlag, "Entry does not exist");
+        require(entryType == EntryType.FILE, "Not a file");
+        
+        return _readFromClusters(storageSlot, offset, length, fileSize);
+    }
+    
+    /**
+     * @dev Write file content at a specific offset
+     */
+    function writeFile(uint256 storageSlot, uint256 offset, bytes memory content) public override {
+        uint256 metadataSlot = _getMetadataSlot(storageSlot);
+        uint256 packed = _sload(metadataSlot);
+        (address owner, EntryType entryType, bool existsFlag, , uint32 currentSize) = _unpackMetadata(packed);
+        
+        if (!existsFlag) {
+            // Create new file
+            createFile(storageSlot, content, offset);
             return;
         }
         
-        require(entry.owner == msg.sender, "Not owner");
-        require(entry.entryType == EntryType.FILE, "Not a file");
+        require(owner == msg.sender, "Not owner");
+        require(entryType == EntryType.FILE, "Not a file");
         
-        bytes memory currentContent = entry.content;
-        uint256 currentLength = currentContent.length;
-        uint256 newLength = offset + content.length;
-        
-        // Determine the final length (max of current length and new end position)
-        uint256 finalLength = newLength > currentLength ? newLength : currentLength;
-        
-        // Create new content array
-        bytes memory newContent = new bytes(finalLength);
-        
-        // Copy existing content up to offset
-        for (uint256 i = 0; i < currentLength && i < offset; i++) {
-            newContent[i] = currentContent[i];
+        uint256 newSize = offset + content.length;
+        if (newSize > currentSize) {
+            newSize = newSize > type(uint32).max ? type(uint32).max : newSize;
+        } else if (offset == 0 && content.length < currentSize) {
+            newSize = content.length;
+        } else {
+            newSize = currentSize;
         }
         
-        // Write new content at offset
-        for (uint256 i = 0; i < content.length; i++) {
-            newContent[offset + i] = content[i];
-        }
+        _writeToClusters(storageSlot, content, offset);
         
-        // Copy remaining existing content if offset + content.length < currentLength
-        if (offset + content.length < currentLength) {
-            for (uint256 i = offset + content.length; i < currentLength; i++) {
-                newContent[i] = currentContent[i];
+        uint256 newPacked = _packMetadata(
+            msg.sender,
+            EntryType.FILE,
+            true,
+            uint64(block.timestamp),
+            uint32(newSize)
+        );
+        _sstore(metadataSlot, newPacked);
+        
+        emit FileUpdated(msg.sender, storageSlot, block.timestamp, offset);
+    }
+    
+    /**
+     * @dev Read a specific cluster (32-byte chunk) from file storage
+     */
+    function readCluster(uint256 storageSlot, uint256 clusterIndex) 
+        public 
+        view 
+        override
+        returns (uint256 clusterData) 
+    {
+        uint256 clusterSlot = _getClusterSlot(storageSlot, clusterIndex);
+        return _sload(clusterSlot);
+    }
+    
+    /**
+     * @dev Add entry slot to enumeration list (using storage slot 3)
+     */
+    function _addEntrySlot(uint256 storageSlot) private {
+        // Get array length slot
+        uint256 lengthSlot = SLOT_ENTRY_SLOTS;
+        uint256 length = _sload(lengthSlot);
+        
+        // Calculate slot for new element
+        uint256 elementSlot = uint256(keccak256(abi.encodePacked(lengthSlot))) + length;
+        _sstore(elementSlot, storageSlot);
+        
+        // Update length
+        _sstore(lengthSlot, length + 1);
+    }
+    
+    /**
+     * @dev Remove entry slot from enumeration list
+     */
+    function _removeEntrySlot(uint256 storageSlot) private {
+        uint256 lengthSlot = SLOT_ENTRY_SLOTS;
+        uint256 length = _sload(lengthSlot);
+        
+        // Find and remove
+        for (uint256 i = 0; i < length; i++) {
+            uint256 elementSlot = uint256(keccak256(abi.encodePacked(lengthSlot))) + i;
+            if (_sload(elementSlot) == storageSlot) {
+                // Move last element to this position
+                if (i < length - 1) {
+                    uint256 lastSlot = uint256(keccak256(abi.encodePacked(lengthSlot))) + (length - 1);
+                    uint256 lastValue = _sload(lastSlot);
+                    _sstore(elementSlot, lastValue);
+                }
+                // Decrease length
+                _sstore(lengthSlot, length - 1);
+                break;
             }
         }
+    }
+    
+    /**
+     * @dev Get all entry slots
+     */
+    function _getEntrySlots() private view returns (uint256[] memory) {
+        uint256 lengthSlot = SLOT_ENTRY_SLOTS;
+        uint256 length = _sload(lengthSlot);
+        uint256[] memory slots = new uint256[](length);
         
-        entries[msg.sender][path].content = newContent;
-        entries[msg.sender][path].timestamp = block.timestamp;
+        for (uint256 i = 0; i < length; i++) {
+            uint256 elementSlot = uint256(keccak256(abi.encodePacked(lengthSlot))) + i;
+            slots[i] = _sload(elementSlot);
+        }
         
-        emit FileUpdated(msg.sender, path, block.timestamp);
+        return slots;
     }
 }
