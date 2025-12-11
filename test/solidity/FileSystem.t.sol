@@ -3,6 +3,7 @@ pragma solidity ^0.8.0;
 
 import "forge-std/Test.sol";
 import "../../contracts/FileSystem.sol";
+import "../../contracts/IFileSystem.sol";
 
 contract FileSystemTest is Test {
     FileSystem public fs;
@@ -21,16 +22,16 @@ contract FileSystemTest is Test {
 
         (
             string memory name,
-            FileSystem.EntryType entryType,
+            IFileSystem.EntryType entryType,
             address owner,
             bytes memory content,
             uint256 timestamp,
-            bool exists
+            bool entryExists
         ) = fs.getEntry(user1, "test.txt");
 
-        assertTrue(exists);
+        assertTrue(entryExists);
         assertEq(name, "test.txt");
-        assertEq(uint(entryType), uint(FileSystem.EntryType.FILE));
+        assertEq(uint(entryType), uint(IFileSystem.EntryType.FILE));
         assertEq(owner, user1);
         assertEq(string(content), "Hello, World!");
         assertGt(timestamp, 0);
@@ -42,16 +43,16 @@ contract FileSystemTest is Test {
 
         (
             string memory name,
-            FileSystem.EntryType entryType,
+            IFileSystem.EntryType entryType,
             address owner,
             bytes memory content,
             ,
-            bool exists
+            bool entryExists
         ) = fs.getEntry(user1, "mydir");
 
-        assertTrue(exists);
+        assertTrue(entryExists);
         assertEq(name, "mydir");
-        assertEq(uint(entryType), uint(FileSystem.EntryType.DIRECTORY));
+        assertEq(uint(entryType), uint(IFileSystem.EntryType.DIRECTORY));
         assertEq(owner, user1);
         assertEq(content.length, 0);
     }
@@ -90,8 +91,8 @@ contract FileSystemTest is Test {
         fs.deleteEntry("test.txt");
         vm.stopPrank();
 
-        (, , , , , bool exists) = fs.getEntry(user1, "test.txt");
-        assertFalse(exists);
+        (, , , , , bool entryExists) = fs.getEntry(user1, "test.txt");
+        assertFalse(entryExists);
     }
 
     function testDeleteRemovesFromPathList() public {
