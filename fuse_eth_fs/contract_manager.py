@@ -6,6 +6,7 @@ import logging
 from typing import Optional, List, Tuple, Dict
 from web3 import Web3
 from web3.contract import Contract
+from eth_account import Account
 
 logger = logging.getLogger(__name__)
 
@@ -13,7 +14,7 @@ logger = logging.getLogger(__name__)
 class ContractManager:
     """Manages interactions with the FileSystem smart contract"""
     
-    def __init__(self, w3: Web3, contract_address: str, abi_path: Optional[str] = None):
+    def __init__(self, w3: Web3, contract_address: str, abi_path: Optional[str] = None, transaction_account: Optional[Account] = None):
         """
         Initialize the contract manager
         
@@ -21,9 +22,11 @@ class ContractManager:
             w3: Web3 instance
             contract_address: Address of the deployed FileSystem contract
             abi_path: Path to the contract ABI JSON file (optional)
+            transaction_account: Account to use for signing transactions (optional)
         """
         self.w3 = w3
         self.contract_address = Web3.to_checksum_address(contract_address)
+        self.transaction_account = transaction_account
         
         # Path to storage slot mapping per account (starting from 0)
         # Maps (account, path) -> storage_slot
@@ -138,6 +141,55 @@ class ContractManager:
             abi=abi
         )
     
+    def _send_transaction(self, function_call, tx_params: dict) -> str:
+        """
+        Send a transaction, signing it with the transaction_account if available.
+        
+        Args:
+            function_call: The contract function call (e.g., contract.functions.createFile(...))
+            tx_params: Transaction parameters (e.g., {'from': account})
+            
+        Returns:
+            Transaction hash
+        """
+        if self.transaction_account:
+            # Use transaction account address for the transaction
+            tx_params_with_account = tx_params.copy()
+            tx_params_with_account['from'] = self.transaction_account.address
+            
+            # Build the transaction
+            tx = function_call.build_transaction(tx_params_with_account)
+            
+            # Ensure nonce is set (build_transaction might not set it)
+            if 'nonce' not in tx:
+                tx['nonce'] = self.w3.eth.get_transaction_count(self.transaction_account.address)
+            
+            # Ensure chain ID is set
+            if 'chainId' not in tx:
+                tx['chainId'] = self.w3.eth.chain_id
+            
+            # Get gas price if not set (for legacy transactions)
+            if 'gasPrice' not in tx and 'maxFeePerGas' not in tx:
+                tx['gasPrice'] = self.w3.eth.gas_price
+            
+            # Estimate gas if not provided
+            if 'gas' not in tx:
+                try:
+                    tx['gas'] = function_call.estimate_gas(tx_params_with_account)
+                except Exception as e:
+                    logger.warning(f"Could not estimate gas, using default: {e}")
+                    tx['gas'] = 100000  # Fallback gas limit
+            
+            # Sign the transaction
+            signed_tx = self.transaction_account.sign_transaction(tx)
+            
+            # Send the signed transaction
+            tx_hash = self.w3.eth.send_raw_transaction(signed_tx.rawTransaction)
+            return tx_hash
+        else:
+            # Fall back to default behavior (requires node to handle signing)
+            return function_call.transact(tx_params)
+    
     def _get_storage_slot(self, account: str, path: str) -> int:
         """
         Get storage slot for a path.
@@ -201,7 +253,12 @@ class ContractManager:
             name_bytes = path.encode('utf-8')
             
             # Create the file (contract will auto-assign storage slot)
-            tx_hash = self.contract.functions.createFile(name_bytes, body, 0).transact({'from': account})
+            # Use transaction_account address if available, otherwise use account from path
+            from_address = self.transaction_account.address if self.transaction_account else account
+            tx_hash = self._send_transaction(
+                self.contract.functions.createFile(name_bytes, body, 0),
+                {'from': from_address}
+            )
             self.w3.eth.wait_for_transaction_receipt(tx_hash)
             
             # Find the newly assigned slot
@@ -244,7 +301,12 @@ class ContractManager:
             if target_address is None:
                 target_address = "0x0000000000000000000000000000000000000000"
             
-            tx_hash = self.contract.functions.createDirectory(name_bytes, target_address).transact({'from': account})
+            # Use transaction_account address if available, otherwise use account from path
+            from_address = self.transaction_account.address if self.transaction_account else account
+            tx_hash = self._send_transaction(
+                self.contract.functions.createDirectory(name_bytes, target_address),
+                {'from': from_address}
+            )
             self.w3.eth.wait_for_transaction_receipt(tx_hash)
             
             # Find the newly assigned slot
@@ -272,7 +334,12 @@ class ContractManager:
             if storage_slot is None:
                 logger.error(f"File '{path}' not found for account {account}")
                 return False
-            tx_hash = self.contract.functions.updateFile(storage_slot, body, 0).transact({'from': account})
+            # Use transaction_account address if available, otherwise use account from path
+            from_address = self.transaction_account.address if self.transaction_account else account
+            tx_hash = self._send_transaction(
+                self.contract.functions.updateFile(storage_slot, body, 0),
+                {'from': from_address}
+            )
             self.w3.eth.wait_for_transaction_receipt(tx_hash)
             logger.info(f"Updated file '{path}' at slot {storage_slot} for account {account}")
             return True
@@ -287,7 +354,12 @@ class ContractManager:
             if storage_slot is None:
                 logger.error(f"Entry '{path}' not found for account {account}")
                 return False
-            tx_hash = self.contract.functions.deleteEntry(storage_slot).transact({'from': account})
+            # Use transaction_account address if available, otherwise use account from path
+            from_address = self.transaction_account.address if self.transaction_account else account
+            tx_hash = self._send_transaction(
+                self.contract.functions.deleteEntry(storage_slot),
+                {'from': from_address}
+            )
             self.w3.eth.wait_for_transaction_receipt(tx_hash)
             # Remove from mapping
             key = (account.lower(), path)
@@ -370,7 +442,12 @@ class ContractManager:
                 return self.create_file(path, body, account)
             
             # File exists, write to it
-            tx_hash = self.contract.functions.writeFile(storage_slot, offset, body).transact({'from': account})
+            # Use transaction_account address if available, otherwise use account from path
+            from_address = self.transaction_account.address if self.transaction_account else account
+            tx_hash = self._send_transaction(
+                self.contract.functions.writeFile(storage_slot, offset, body),
+                {'from': from_address}
+            )
             self.w3.eth.wait_for_transaction_receipt(tx_hash)
             logger.info(f"Wrote to file '{path}' at offset {offset} for account {account}")
             return True

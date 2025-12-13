@@ -8,6 +8,7 @@ import time
 from typing import Dict, Optional, Tuple, List, Set
 from fuse import FuseOSError, Operations, LoggingMixIn
 from web3 import Web3
+from eth_account import Account
 
 from .rpc_manager import RPCManager
 from .contract_manager import ContractManager
@@ -36,6 +37,20 @@ class EthFS(LoggingMixIn, Operations):
         self.contract_addresses = contract_addresses
         self.rpc_manager = RPCManager()
         
+        # Load private key from environment and create account
+        private_key = os.environ.get('PRIVATE_KEY')
+        self.transaction_account = None
+        if private_key:
+            try:
+                # Remove '0x' prefix if present
+                if private_key.startswith('0x'):
+                    private_key = private_key[2:]
+                self.transaction_account = Account.from_key(private_key)
+                logger.info(f"Loaded transaction account: {self.transaction_account.address}")
+            except Exception as e:
+                logger.warning(f"Failed to load account from PRIVATE_KEY: {e}")
+                logger.warning("Transactions will fail if PRIVATE_KEY is not set correctly")
+        
         # Initialize contract managers for each chain
         self.contract_managers: Dict[int, ContractManager] = {}
         for chain_id, address in contract_addresses.items():
@@ -43,7 +58,7 @@ class EthFS(LoggingMixIn, Operations):
             if w3 is None:
                 logger.warning(f"Could not connect to chain {chain_id}, skipping")
                 continue
-            self.contract_managers[chain_id] = ContractManager(w3, address)
+            self.contract_managers[chain_id] = ContractManager(w3, address, transaction_account=self.transaction_account)
         
         # Cache for directory listings and file metadata
         # Maps (chain_id, account, path) -> entry_info
@@ -366,7 +381,7 @@ class EthFS(LoggingMixIn, Operations):
             return self.contract_managers[chain_id]  # Fallback to default
         
         try:
-            new_manager = ContractManager(w3, contract_address)
+            new_manager = ContractManager(w3, contract_address, transaction_account=self.transaction_account)
             self._contract_manager_cache[cache_key] = new_manager
             return new_manager
         except Exception as e:
