@@ -31,7 +31,8 @@ class TestContractManager(unittest.TestCase):
         result = self.manager.create_file('test.txt', b'content', '0xuser')
         
         self.assertTrue(result)
-        self.mock_contract.functions.createFile.assert_called_once_with('test.txt', b'content')
+        # Should be called with name, body, and offset (0)
+        self.mock_contract.functions.createFile.assert_called_once_with(b'test.txt', b'content', 0)
     
     def test_create_file_failure(self):
         """Test file creation failure"""
@@ -52,7 +53,8 @@ class TestContractManager(unittest.TestCase):
         result = self.manager.create_directory('mydir', '0xuser')
         
         self.assertTrue(result)
-        self.mock_contract.functions.createDirectory.assert_called_once_with('mydir')
+        # Should be called with target address
+        self.mock_contract.functions.createDirectory.assert_called_once_with("0x0000000000000000000000000000000000000000")
     
     def test_update_file_success(self):
         """Test successful file update"""
@@ -65,7 +67,8 @@ class TestContractManager(unittest.TestCase):
         result = self.manager.update_file('test.txt', b'new content', '0xuser')
         
         self.assertTrue(result)
-        self.mock_contract.functions.updateFile.assert_called_once_with('test.txt', b'new content')
+        # Should be called with storage slot (0 for first file), body, and offset (0)
+        self.mock_contract.functions.updateFile.assert_called_once_with(0, b'new content', 0)
     
     def test_delete_entry_success(self):
         """Test successful entry deletion"""
@@ -78,17 +81,20 @@ class TestContractManager(unittest.TestCase):
         result = self.manager.delete_entry('test.txt', '0xuser')
         
         self.assertTrue(result)
-        self.mock_contract.functions.deleteEntry.assert_called_once_with('test.txt')
+        # Should be called with storage slot (0 for first entry)
+        self.mock_contract.functions.deleteEntry.assert_called_once_with(0)
     
     def test_get_entry(self):
         """Test getting entry information"""
         expected_entry = (
-            'test.txt',  # name
             0,           # entryType (FILE)
             '0xuser',    # owner
-            b'content',  # content
+            b'test.txt', # name
+            b'content',  # body
             1234567890,  # timestamp
-            True         # exists
+            True,        # entryExists
+            7,           # fileSize
+            '0x0000000000000000000000000000000000000000'  # directoryTarget
         )
         
         self.mock_contract.functions.getEntry.return_value.call.return_value = expected_entry
@@ -96,7 +102,8 @@ class TestContractManager(unittest.TestCase):
         result = self.manager.get_entry('0xuser', 'test.txt')
         
         self.assertEqual(result, expected_entry)
-        self.mock_contract.functions.getEntry.assert_called_once_with('0xuser', 'test.txt')
+        # Should be called with storage slot (0 for first entry)
+        self.mock_contract.functions.getEntry.assert_called_once_with(0)
     
     def test_get_entry_failure(self):
         """Test getting entry when call fails"""
@@ -108,14 +115,37 @@ class TestContractManager(unittest.TestCase):
     
     def test_get_account_paths(self):
         """Test getting all paths for an account"""
-        expected_paths = ['file1.txt', 'file2.txt', 'dir1']
+        # Mock getEntries to return storage slots
+        self.mock_contract.functions.getEntries.return_value.call.return_value = [0, 1, 2]
         
-        self.mock_contract.functions.getAccountPaths.return_value.call.return_value = expected_paths
+        # Mock getEntry for each slot to return entry info
+        def mock_get_entry(slot):
+            mock_entry = Mock()
+            if slot == 0:
+                mock_entry.call.return_value = (0, '0xuser', b'file1.txt', b'content1', 1234567890, True, 8, '0x0000000000000000000000000000000000000000')
+            elif slot == 1:
+                mock_entry.call.return_value = (0, '0xuser', b'file2.txt', b'content2', 1234567890, True, 8, '0x0000000000000000000000000000000000000000')
+            elif slot == 2:
+                mock_entry.call.return_value = (1, '0xuser', b'', b'', 1234567890, True, 0, '0x0000000000000000000000000000000000000000')
+            return mock_entry
+        
+        self.mock_contract.functions.getEntry.side_effect = mock_get_entry
+        
+        # Set up path mappings
+        self.manager.path_to_slot[('0xuser', 'file1.txt')] = 0
+        self.manager.slot_to_path[('0xuser', 0)] = 'file1.txt'
+        self.manager.path_to_slot[('0xuser', 'file2.txt')] = 1
+        self.manager.slot_to_path[('0xuser', 1)] = 'file2.txt'
+        self.manager.path_to_slot[('0xuser', 'dir1')] = 2
+        self.manager.slot_to_path[('0xuser', 2)] = 'dir1'
         
         result = self.manager.get_account_paths('0xuser')
         
-        self.assertEqual(result, expected_paths)
-        self.mock_contract.functions.getAccountPaths.assert_called_once_with('0xuser')
+        # Should return paths that we have mappings for
+        self.assertIn('file1.txt', result)
+        self.assertIn('file2.txt', result)
+        self.assertIn('dir1', result)
+        self.mock_contract.functions.getEntries.assert_called_once()
     
     def test_exists_true(self):
         """Test checking if entry exists (true case)"""
@@ -124,7 +154,8 @@ class TestContractManager(unittest.TestCase):
         result = self.manager.exists('0xuser', 'test.txt')
         
         self.assertTrue(result)
-        self.mock_contract.functions.exists.assert_called_once_with('0xuser', 'test.txt')
+        # Should be called with storage slot (0 for first entry)
+        self.mock_contract.functions.exists.assert_called_once_with(0)
     
     def test_exists_false(self):
         """Test checking if entry exists (false case)"""
@@ -133,6 +164,8 @@ class TestContractManager(unittest.TestCase):
         result = self.manager.exists('0xuser', 'nonexistent.txt')
         
         self.assertFalse(result)
+        # Should be called with storage slot (0 for first entry, even if it doesn't exist)
+        self.mock_contract.functions.exists.assert_called_once_with(0)
 
 
 if __name__ == '__main__':

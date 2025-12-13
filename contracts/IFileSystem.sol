@@ -8,15 +8,15 @@ pragma solidity ^0.8.0;
  * Entries are identified by storage slot numbers, accessed via Yul assembly
  */
 interface IFileSystem {
-    enum EntryType { FILE, DIRECTORY }
+    enum EntryType { FILE, DIRECTORY, LINK }
     
     // Packed entry metadata structure (stored in uint256 at specific storage slot)
-    // Layout: owner (160 bits) | entryType (1 bit) | exists (1 bit) | timestamp (64 bits) | fileSize (30 bits)
+    // Layout: entryType (1 bit) | timestamp (64 bits) | fileSize (30 bits)
+    // Owner and group are stored in dedicated slots using keccak256 constants
+    // Existence is determined by timestamp > 0
     struct EntryMetadata {
-        address owner;      // 160 bits
-        EntryType entryType; // 1 bit (0=FILE, 1=DIRECTORY)
-        bool exists;         // 1 bit
-        uint64 timestamp;    // 64 bits
+        EntryType entryType; // 1 bit (0=FILE, 1=DIRECTORY, 2=LINK)
+        uint64 timestamp;    // 64 bits (0 means entry doesn't exist)
         uint32 fileSize;     // 30 bits (max ~1GB file)
     }
     
@@ -33,27 +33,26 @@ interface IFileSystem {
     event EntryDeleted(address indexed owner, uint256 indexed storageSlot);
     
     /**
-     * @dev Create a new file with optional offset at a specific storage slot
-     * @param storageSlot The storage slot number for this entry
-     * @param content The content of the file
+     * @dev Create a new file with optional offset (storage slot auto-assigned starting from 0)
+     * @param name The name of the file
+     * @param body The body/content of the file
      * @param offset The byte offset to start writing at (default 0)
      */
-    function createFile(uint256 storageSlot, bytes memory content, uint256 offset) external;
+    function createFile(bytes memory name, bytes memory body, uint256 offset) external;
     
     /**
-     * @dev Create a new directory pointing to another IFileSystem contract at a specific storage slot
-     * @param storageSlot The storage slot number for this entry
+     * @dev Create a new directory pointing to another IFileSystem contract (storage slot auto-assigned starting from 0)
      * @param target The address of the IFileSystem contract this directory points to
      */
-    function createDirectory(uint256 storageSlot, address target) external;
+    function createDirectory(address target) external;
     
     /**
-     * @dev Update file content at a specific offset
+     * @dev Update file body at a specific offset
      * @param storageSlot The storage slot number of the file
-     * @param content The new content of the file
+     * @param body The new body/content of the file
      * @param offset The byte offset to start writing at (default 0)
      */
-    function updateFile(uint256 storageSlot, bytes memory content, uint256 offset) external;
+    function updateFile(uint256 storageSlot, bytes memory body, uint256 offset) external;
     
     /**
      * @dev Delete an entry (file or directory)
@@ -66,7 +65,8 @@ interface IFileSystem {
      * @param storageSlot The storage slot number
      * @return entryType The type of the entry (FILE or DIRECTORY)
      * @return owner The owner of the entry
-     * @return content The content (for files, reconstructed from clusters)
+     * @return name The name of the file (empty for directories)
+     * @return body The body/content (for files, reconstructed from clusters)
      * @return timestamp The last modification timestamp
      * @return entryExists Whether the entry exists
      * @return fileSize The size of the file in bytes
@@ -78,7 +78,8 @@ interface IFileSystem {
         returns (
             EntryType entryType,
             address owner,
-            bytes memory content,
+            bytes memory name,
+            bytes memory body,
             uint256 timestamp,
             bool entryExists,
             uint256 fileSize,
@@ -99,24 +100,24 @@ interface IFileSystem {
     function exists(uint256 storageSlot) external view returns (bool);
     
     /**
-     * @dev Read file content at a specific offset
+     * @dev Read file body at a specific offset
      * @param storageSlot The storage slot number of the file
      * @param offset The byte offset to start reading from
      * @param length The number of bytes to read (0 means read to end)
-     * @return content The content bytes at the specified offset
+     * @return body The body bytes at the specified offset
      */
     function readFile(uint256 storageSlot, uint256 offset, uint256 length) 
         external 
         view 
-        returns (bytes memory content);
+        returns (bytes memory body);
     
     /**
-     * @dev Write file content at a specific offset
+     * @dev Write file body at a specific offset
      * @param storageSlot The storage slot number of the file
      * @param offset The byte offset to start writing at
-     * @param content The content bytes to write
+     * @param body The body bytes to write
      */
-    function writeFile(uint256 storageSlot, uint256 offset, bytes memory content) external;
+    function writeFile(uint256 storageSlot, uint256 offset, bytes memory body) external;
     
     /**
      * @dev Read a specific cluster (32-byte chunk) from file storage

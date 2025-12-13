@@ -84,10 +84,84 @@ class EthFS(LoggingMixIn, Operations):
         relative_path = '/'.join(parts[2:])
         return (chain_id, account, relative_path)
     
+    def _get_storage_slot_for_path(self, chain_id: int, account: str, rel_path: str) -> Optional[int]:
+        """Get storage slot for a given path using ContractManager's mapping"""
+        if chain_id not in self.contract_managers:
+            return None
+        contract_mgr = self.contract_managers[chain_id]
+        # Use ContractManager's internal mapping to get storage slot
+        key = (account.lower(), rel_path)
+        if key in contract_mgr.path_to_slot:
+            return contract_mgr.path_to_slot[key]
+        return None
+    
+    def _find_entry_by_path(self, chain_id: int, account: str, rel_path: str) -> Optional[tuple]:
+        """
+        Find an entry by path using IFileSystem.getEntries() and getEntry()
+        Returns: (storage_slot, entry_info) or None
+        """
+        if chain_id not in self.contract_managers:
+            return None
+        
+        contract_mgr = self.contract_managers[chain_id]
+        contract = contract_mgr.contract
+        
+        # First try to get storage slot from mapping
+        storage_slot = self._get_storage_slot_for_path(chain_id, account, rel_path)
+        if storage_slot is not None:
+            try:
+                entry = contract.functions.getEntry(storage_slot).call()
+                entry_type, owner, name, body, timestamp, entry_exists, file_size, dir_target = entry
+                if entry_exists and owner.lower() == account.lower():
+                    # Verify the name matches (for files)
+                    if entry_type == 0:  # FILE
+                        filename = rel_path.split('/')[-1] if '/' in rel_path else rel_path
+                        if name.decode('utf-8', errors='ignore') == filename:
+                            return (storage_slot, entry)
+                    else:  # DIRECTORY
+                        # For directories, we need to check if the path matches
+                        # This is a simplified check - in practice, directory structure
+                        # might need more sophisticated matching
+                        return (storage_slot, entry)
+            except Exception:
+                pass
+        
+        # If not found in mapping, search all entries
+        try:
+            all_slots = contract.functions.getEntries().call()
+            account_lower = account.lower()
+            filename = rel_path.split('/')[-1] if '/' in rel_path else rel_path
+            
+            for slot in all_slots:
+                try:
+                    entry = contract.functions.getEntry(slot).call()
+                    entry_type, owner, name_bytes, body, timestamp, entry_exists, file_size, dir_target = entry
+                    
+                    if entry_exists and owner.lower() == account_lower:
+                        # For files, check if name matches
+                        if entry_type == 0:  # FILE
+                            entry_name = name_bytes.decode('utf-8', errors='ignore')
+                            if entry_name == filename:
+                                # Update mapping for future lookups
+                                key = (account.lower(), rel_path)
+                                contract_mgr.path_to_slot[key] = slot
+                                contract_mgr.slot_to_path[(account.lower(), slot)] = rel_path
+                                return (slot, entry)
+                        # For directories, we'd need more sophisticated matching
+                        # For now, skip directories in this search
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        
+        return None
+    
     def getattr(self, path, fh=None):
         """Get file attributes"""
+
+        print(f"Getting attributes for path: {path}")
         chain_id, account, rel_path = self._parse_path(path)
-        
+        print(f"Parsed path: {chain_id}, {account}, {rel_path}")
         # Root directory
         if chain_id is None:
             return dict(
@@ -110,8 +184,9 @@ class EthFS(LoggingMixIn, Operations):
                 )
             raise FuseOSError(errno.ENOENT)
         
-        # Account directory
+        # Account directory - always a directory that lists entries
         if rel_path is None:
+            # The account level is always a directory that contains entries
             return dict(
                 st_mode=(stat.S_IFDIR | 0o755),
                 st_nlink=2,
@@ -119,22 +194,21 @@ class EthFS(LoggingMixIn, Operations):
                 st_mtime=time.time(),
                 st_atime=time.time()
             )
-        
-        # File or directory in contract storage
-        if chain_id not in self.contract_managers:
+        # File or directory in contract storage - use IFileSystem.getEntry()
+        result = self._find_entry_by_path(chain_id, account, rel_path)
+        print(f"Result: {result}")
+        if result is None:
             raise FuseOSError(errno.ENOENT)
         
-        contract_mgr = self.contract_managers[chain_id]
-        entry = contract_mgr.get_entry(account, rel_path)
+        storage_slot, entry = result
+        entry_type, owner, name, body, timestamp, entry_exists, file_size, dir_target = entry
         
-        if entry is None or not entry[5]:  # entry[5] is 'exists'
+        print(f"Entry type: {entry_type}")
+        print(f"Entry exists: {entry_exists}")
+        if not entry_exists:
             raise FuseOSError(errno.ENOENT)
         
-        # entry = (name, entryType, owner, content, timestamp, exists)
-        entry_type = entry[1]  # 0 = FILE, 1 = DIRECTORY
-        content = entry[3]
-        timestamp = entry[4]
-        
+        print(f"Entry type: {entry_type}")
         if entry_type == 1:  # DIRECTORY
             return dict(
                 st_mode=(stat.S_IFDIR | 0o755),
@@ -147,16 +221,15 @@ class EthFS(LoggingMixIn, Operations):
             return dict(
                 st_mode=(stat.S_IFREG | 0o644),
                 st_nlink=1,
-                st_size=len(content),
+                st_size=file_size,
                 st_ctime=timestamp,
                 st_mtime=timestamp,
                 st_atime=timestamp
             )
     
     def readdir(self, path, fh):
-        """Read directory contents"""
+        """Read directory contents using IFileSystem.getEntries() and getEntry()"""
         chain_id, account, rel_path = self._parse_path(path)
-        
         entries = ['.', '..']
         
         # Root directory - list chain IDs
@@ -172,61 +245,160 @@ class EthFS(LoggingMixIn, Operations):
             entries.append(self.default_account)
             return entries
         
-        # Account directory or subdirectory
+        # Account directory or subdirectory - use IFileSystem.getEntries()
         if chain_id not in self.contract_managers:
             return entries
         
         contract_mgr = self.contract_managers[chain_id]
+        contract = contract_mgr.contract
         
-        # Get all paths for the account
-        all_paths = contract_mgr.get_account_paths(account)
-        
-        # Filter paths that are direct children of current path
-        if rel_path is None:
-            # Root of account directory
-            current_prefix = ""
-        else:
-            current_prefix = rel_path + "/"
-        
-        seen = set()
-        for full_path in all_paths:
-            if current_prefix and not full_path.startswith(current_prefix):
-                continue
+        try:
+            # Get all storage slots using IFileSystem.getEntries()
+            print(f"Getting all storage slots for account: {account}", contract.address)
+            print(contract.functions)
+            print(contract.functions.getEntries)
+            print(contract.functions.getEntries().call())
+            all_slots = contract.functions.getEntries().call()
+            account_lower = account.lower()
             
-            # Get the relative part
-            if current_prefix:
-                rel = full_path[len(current_prefix):]
+            # Determine the current directory prefix
+            if rel_path is None:
+                current_prefix = ""
             else:
-                rel = full_path
+                current_prefix = rel_path + "/"
             
-            # Get only direct children
-            if '/' in rel:
-                # This is a deeper path, just get the directory name
-                child = rel.split('/')[0]
-            else:
-                child = rel
+            seen = set()
             
-            if child and child not in seen:
-                seen.add(child)
-                entries.append(child)
+            # Iterate through all entries and filter by owner
+            for slot in all_slots:
+                try:
+                    # Use IFileSystem.getEntry() to get entry information
+                    entry = contract.functions.getEntry(slot).call()
+                    entry_type, owner, name_bytes, body, timestamp, entry_exists, file_size, dir_target = entry
+                    print(f"Entry: {entry}")
+                    print(f"Entry type: {entry_type}")
+                    print(f"Owner: {owner}")
+                    print(f"Name: {name_bytes}")
+                    print(f"Body: {body}")
+                    print(f"Timestamp: {timestamp}")
+                    print(f"Entry exists: {entry_exists}")
+                    print(f"File size: {file_size}")
+                    print(f"Directory target: {dir_target}")
+                    if not entry_exists:
+                        continue
+                    
+                    # Try to get path from mapping first
+                    path_for_slot = contract_mgr._get_path_from_slot(account, slot)
+                    print(f"Path for slot: {path_for_slot}")
+                    if path_for_slot is None:
+                        # No mapping exists - this happens for entries created outside our mapping
+                        # For files, use the name directly
+                        if entry_type == 0:  # FILE
+                            entry_name = name_bytes.decode('utf-8', errors='ignore')
+                            if entry_name and current_prefix == "":
+                                # Root level - use entry name directly
+                                if entry_name not in seen:
+                                    seen.add(entry_name)
+                                    entries.append(entry_name)
+                                    # Update mapping for future lookups
+                                    key = (account.lower(), entry_name)
+                                    contract_mgr.path_to_slot[key] = slot
+                                    contract_mgr.slot_to_path[(account.lower(), slot)] = entry_name
+                        # For directories without mapping, use slot number as name
+                        elif entry_type == 1:  # DIRECTORY
+                            if current_prefix == "":
+                                # Root level - use slot number as directory name
+                                dir_name = f"dir_{slot}"
+                                if dir_name not in seen:
+                                    seen.add(dir_name)
+                                    entries.append(dir_name)
+                                    # Update mapping
+                                    key = (account.lower(), dir_name)
+                                    contract_mgr.path_to_slot[key] = slot
+                                    contract_mgr.slot_to_path[(account.lower(), slot)] = dir_name
+                        continue
+                    
+                    print(f"Path for slot: {path_for_slot}")
+                    print(f"Current prefix: {current_prefix}")
+                    # Check if this path is a direct child of current path
+                    if current_prefix and not path_for_slot.startswith(current_prefix):
+                        continue
+                    
+                    # Get the relative part
+                    if current_prefix:
+                        rel = path_for_slot[len(current_prefix):]
+                    else:
+                        rel = path_for_slot
+                    
+                    # Get only direct children (first component of path)
+                    if '/' in rel:
+                        # This is a deeper path, just get the directory name
+                        child = rel.split('/')[0]
+                    else:
+                        child = rel
+                    
+                    if child and child not in seen:
+                        seen.add(child)
+                        entries.append(child)
+                        
+                except Exception as e:
+                    # Log error but continue processing other entries
+                    print(f"Error processing slot {slot}: {e}")
+                    continue
+                    
+        except Exception as e:
+            print(f"Error reading directory {path}: {e}")
+            pass
         
         return entries
     
     def read(self, path, size, offset, fh):
-        """Read file content"""
+        """Read file content using IFileSystem.readFile()"""
         chain_id, account, rel_path = self._parse_path(path)
-        
+        print(f"Reading file content for path: {path}")
+        print(f"Parsed path: {chain_id}, {account}, {rel_path}")
         if chain_id not in self.contract_managers or rel_path is None:
             raise FuseOSError(errno.ENOENT)
         
-        contract_mgr = self.contract_managers[chain_id]
-        entry = contract_mgr.get_entry(account, rel_path)
-        
-        if entry is None or not entry[5]:
+        # Find the entry to get storage slot
+        result = self._find_entry_by_path(chain_id, account, rel_path)
+        if result is None:
             raise FuseOSError(errno.ENOENT)
         
-        content = entry[3]
-        return content[offset:offset + size]
+        storage_slot, entry = result
+        entry_type, owner, name, body, timestamp, entry_exists, file_size, dir_target = entry
+        
+        if not entry_exists or entry_type != 0:  # Must be a file
+            raise FuseOSError(errno.ENOENT)
+        
+        # Use IFileSystem.readFile() to read the file content
+        contract_mgr = self.contract_managers[chain_id]
+        contract = contract_mgr.contract
+        
+        try:
+            print(f"Reading file content for path: {path}")
+            print(f"Storage slot: {storage_slot}")
+            print(f"Offset: {offset}")
+            print(f"Length: {length}")
+            print(f"File size: {file_size}")
+            print(f"Contract: {contract.address}")
+            print(contract.functions)
+            print(contract.functions.readFile)
+            # Read the requested portion using readFile
+            # If size is 0 or very large, read the entire remaining file
+            length = size if size > 0 else (file_size - offset)
+            if offset + length > file_size:
+                length = file_size - offset if offset < file_size else 0
+            
+            if length <= 0:
+                return b''
+            
+            body = contract.functions.readFile(storage_slot, offset, length).call()
+            return body
+        except Exception as e:
+            # Fallback to getting full entry if readFile fails
+            body = entry[3]  # body is at index 3
+            return body[offset:offset + size]
     
     def write(self, path, data, offset, fh):
         """
@@ -246,12 +418,12 @@ class EthFS(LoggingMixIn, Operations):
         # Store the original data length for return value
         bytes_to_write = len(data)
         
-        # Handle partial writes by reading existing content and merging
+        # Handle partial writes by reading existing body and merging
         # WARNING: This is expensive as it reads the entire file from blockchain
         if offset != 0:
             entry = contract_mgr.get_entry(account, rel_path)
-            if entry and entry[5]:
-                existing = bytearray(entry[3])
+            if entry and entry[5]:  # entry[5] is 'entryExists'
+                existing = bytearray(entry[3])  # body is at index 3
                 # Extend the buffer if offset is beyond current length
                 if offset + len(data) > len(existing):
                     existing.extend(b'\0' * (offset + len(data) - len(existing)))
@@ -336,13 +508,13 @@ class EthFS(LoggingMixIn, Operations):
         contract_mgr = self.contract_managers[chain_id]
         entry = contract_mgr.get_entry(account, rel_path)
         
-        if entry and entry[5]:
-            content = entry[3]
-            if length < len(content):
-                new_content = content[:length]
+        if entry and entry[5]:  # entry[5] is 'entryExists'
+            body = entry[3]  # body is at index 3
+            if length < len(body):
+                new_body = body[:length]
             else:
-                new_content = content + b'\0' * (length - len(content))
+                new_body = body + b'\0' * (length - len(body))
             
-            contract_mgr.update_file(rel_path, new_content, account)
+            contract_mgr.update_file(rel_path, new_body, account)
         
         return 0
