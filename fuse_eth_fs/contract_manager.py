@@ -53,6 +53,7 @@ class ContractManager:
                 },
                 {
                     "inputs": [
+                        {"name": "name", "type": "bytes"},
                         {"name": "target", "type": "address"}
                     ],
                     "name": "createDirectory",
@@ -118,6 +119,17 @@ class ContractManager:
                     "outputs": [{"name": "body", "type": "bytes"}],
                     "stateMutability": "view",
                     "type": "function"
+                },
+                {
+                    "inputs": [
+                        {"name": "storageSlot", "type": "uint256"},
+                        {"name": "offset", "type": "uint256"},
+                        {"name": "body", "type": "bytes"}
+                    ],
+                    "name": "writeFile",
+                    "outputs": [],
+                    "stateMutability": "nonpayable",
+                    "type": "function"
                 }
             ]
         
@@ -128,28 +140,56 @@ class ContractManager:
     
     def _get_storage_slot(self, account: str, path: str) -> int:
         """
-        Get or allocate a storage slot for a path.
-        Storage slots start at 0 for each account.
+        Get storage slot for a path.
+        First checks local mapping, then queries contract if not found.
         """
         key = (account.lower(), path)
         
         if key in self.path_to_slot:
             return self.path_to_slot[key]
         
-        # Allocate new slot starting from 0
-        if account.lower() not in self.next_slot:
-            self.next_slot[account.lower()] = 0
+        # Try to find existing slot by querying contract
+        slot = self._find_slot_by_path(account, path)
+        if slot is not None:
+            return slot
         
-        slot = self.next_slot[account.lower()]
-        self.path_to_slot[key] = slot
-        self.slot_to_path[(account.lower(), slot)] = path
-        self.next_slot[account.lower()] = slot + 1
-        
-        return slot
+        # If not found, we'll need to create it (slot will be auto-assigned by contract)
+        # For now, return a placeholder - the actual slot will be determined after creation
+        # This is a limitation: we can't know the slot before creation
+        # So we should use this method only for existing entries
+        raise ValueError(f"Storage slot not found for path '{path}' - entry may not exist")
     
     def _get_path_from_slot(self, account: str, slot: int) -> Optional[str]:
         """Get path from storage slot"""
         return self.slot_to_path.get((account.lower(), slot))
+    
+    def _find_slot_by_path(self, account: str, path: str) -> Optional[int]:
+        """
+        Find storage slot for a path by querying all entries and matching by name
+        This is used when we don't have a local mapping
+        """
+        try:
+            slots = self.contract.functions.getEntries().call()
+            path_bytes = path.encode('utf-8')
+            
+            for slot in slots:
+                try:
+                    entry = self.contract.functions.getEntry(slot).call()
+                    entry_type, owner, name_bytes, body, timestamp, exists, file_size, dir_target = entry
+                    
+                    if exists and owner.lower() == account.lower():
+                        if (entry_type == 0 or entry_type == 1) and name_bytes == path_bytes:  # FILE or DIRECTORY type
+                            # Update our mapping
+                            key = (account.lower(), path)
+                            self.path_to_slot[key] = slot
+                            self.slot_to_path[(account.lower(), slot)] = path
+                            return slot
+                except:
+                    continue
+            return None
+        except Exception as e:
+            logger.debug(f"Error finding slot for path '{path}': {e}")
+            return None
     
     def create_file(self, path: str, body: bytes, account: str) -> bool:
         """Create a file in the contract storage (storage slot auto-assigned)"""
@@ -157,9 +197,8 @@ class ContractManager:
             # Get existing slots before creation
             existing_slots = set(self.contract.functions.getEntries().call())
             
-            # Extract filename from path
-            filename = path.split('/')[-1] if '/' in path else path
-            name_bytes = filename.encode('utf-8')
+            # Store full path as the name to preserve directory structure
+            name_bytes = path.encode('utf-8')
             
             # Create the file (contract will auto-assign storage slot)
             tx_hash = self.contract.functions.createFile(name_bytes, body, 0).transact({'from': account})
@@ -183,14 +222,29 @@ class ContractManager:
             logger.error(f"Error creating file '{path}' for account {account}: {e}")
             return False
     
-    def create_directory(self, path: str, account: str) -> bool:
-        """Create a directory in the contract storage (storage slot auto-assigned)"""
+    def create_directory(self, path: str, account: str, target_address: Optional[str] = None) -> bool:
+        """
+        Create a directory in the contract storage (storage slot auto-assigned).
+        Directories now store their name in the contract.
+        
+        Args:
+            path: The directory path/name
+            account: The account creating the directory
+            target_address: Optional target FileSystem contract address.
+                          If None, uses address(0) for organizational directories.
+        """
         try:
             # Get existing slots before creation
             existing_slots = set(self.contract.functions.getEntries().call())
             
-            # Directories point to address(0) by default (can be changed later)
-            tx_hash = self.contract.functions.createDirectory("0x0000000000000000000000000000000000000000").transact({'from': account})
+            # Store full path as the name to preserve directory structure
+            name_bytes = path.encode('utf-8')
+            
+            # Use address(0) if no target specified (for organizational directories)
+            if target_address is None:
+                target_address = "0x0000000000000000000000000000000000000000"
+            
+            tx_hash = self.contract.functions.createDirectory(name_bytes, target_address).transact({'from': account})
             self.w3.eth.wait_for_transaction_receipt(tx_hash)
             
             # Find the newly assigned slot
@@ -214,7 +268,10 @@ class ContractManager:
     def update_file(self, path: str, body: bytes, account: str) -> bool:
         """Update file body"""
         try:
-            storage_slot = self._get_storage_slot(account, path)
+            storage_slot = self._find_slot_by_path(account, path)
+            if storage_slot is None:
+                logger.error(f"File '{path}' not found for account {account}")
+                return False
             tx_hash = self.contract.functions.updateFile(storage_slot, body, 0).transact({'from': account})
             self.w3.eth.wait_for_transaction_receipt(tx_hash)
             logger.info(f"Updated file '{path}' at slot {storage_slot} for account {account}")
@@ -226,9 +283,18 @@ class ContractManager:
     def delete_entry(self, path: str, account: str) -> bool:
         """Delete an entry (file or directory)"""
         try:
-            storage_slot = self._get_storage_slot(account, path)
+            storage_slot = self._find_slot_by_path(account, path)
+            if storage_slot is None:
+                logger.error(f"Entry '{path}' not found for account {account}")
+                return False
             tx_hash = self.contract.functions.deleteEntry(storage_slot).transact({'from': account})
             self.w3.eth.wait_for_transaction_receipt(tx_hash)
+            # Remove from mapping
+            key = (account.lower(), path)
+            if key in self.path_to_slot:
+                del self.path_to_slot[key]
+            if (account.lower(), storage_slot) in self.slot_to_path:
+                del self.slot_to_path[(account.lower(), storage_slot)]
             logger.info(f"Deleted entry '{path}' at slot {storage_slot} for account {account}")
             return True
         except Exception as e:
@@ -241,7 +307,9 @@ class ContractManager:
         Returns: (entryType, owner, name, body, timestamp, entryExists, fileSize, directoryTarget)
         """
         try:
-            storage_slot = self._get_storage_slot(account, path)
+            storage_slot = self._find_slot_by_path(account, path)
+            if storage_slot is None:
+                return None
             result = self.contract.functions.getEntry(storage_slot).call()
             # Convert to tuple format expected by filesystem.py
             # entryType, owner, name, body, timestamp, entryExists, fileSize, directoryTarget
@@ -283,8 +351,41 @@ class ContractManager:
     def exists(self, account: str, path: str) -> bool:
         """Check if an entry exists"""
         try:
-            storage_slot = self._get_storage_slot(account, path)
+            storage_slot = self._find_slot_by_path(account, path)
+            if storage_slot is None:
+                return False
             return self.contract.functions.exists(storage_slot).call()
         except Exception as e:
             logger.debug(f"Error checking existence of '{path}' for account {account}: {e}")
             return False
+    
+    def write_file(self, path: str, body: bytes, offset: int, account: str) -> bool:
+        """Write file body at a specific offset (creates file if it doesn't exist)"""
+        try:
+            # Try to find existing slot
+            storage_slot = self._find_slot_by_path(account, path)
+            
+            if storage_slot is None:
+                # File doesn't exist, create it
+                return self.create_file(path, body, account)
+            
+            # File exists, write to it
+            tx_hash = self.contract.functions.writeFile(storage_slot, offset, body).transact({'from': account})
+            self.w3.eth.wait_for_transaction_receipt(tx_hash)
+            logger.info(f"Wrote to file '{path}' at offset {offset} for account {account}")
+            return True
+        except Exception as e:
+            logger.error(f"Error writing to file '{path}' for account {account}: {e}")
+            return False
+    
+    def read_file(self, path: str, offset: int, length: int, account: str) -> Optional[bytes]:
+        """Read file body at a specific offset"""
+        try:
+            storage_slot = self._find_slot_by_path(account, path)
+            if storage_slot is None:
+                return None
+            result = self.contract.functions.readFile(storage_slot, offset, length).call()
+            return result
+        except Exception as e:
+            logger.error(f"Error reading file '{path}' for account {account}: {e}")
+            return None

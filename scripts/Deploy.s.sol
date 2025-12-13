@@ -20,7 +20,7 @@ contract Deploy is Script {
         fileSystem.createFile(bytes("config.txt"), bytes("debug=true\nport=8080\n"), 0);
         
         // Create a directory pointing to the subdirectory
-        fileSystem.createDirectory(address(subDir));
+        fileSystem.createDirectory(bytes("subdir"), address(subDir));
         
         // Create a file in the subdirectory
         subDir.createFile(bytes("nested.txt"), bytes("This is a nested file"), 0);

@@ -42,9 +42,10 @@ interface IFileSystem {
     
     /**
      * @dev Create a new directory pointing to another IFileSystem contract (storage slot auto-assigned starting from 0)
+     * @param name The name of the directory
      * @param target The address of the IFileSystem contract this directory points to
      */
-    function createDirectory(address target) external;
+    function createDirectory(bytes memory name, address target) external;
     
     /**
      * @dev Update file body at a specific offset

@@ -1,33 +1,29 @@
 """
-EthFS - Ethereum-backed FUSE filesystem
-
-Virtual filesystem structure:
-/<chain_id>/<account_address>/<files_and_directories>
-
-Example:
-/1337/0x1234.../file.txt
-/1337/0x1234.../documents/
+FUSE filesystem implementation for Ethereum-backed filesystem
 """
-
 import os
-import errno
+import logging
 import stat
 import time
-from typing import Dict, Optional
-from fuse import FUSE, FuseOSError, Operations, LoggingMixIn
+from typing import Dict, Optional, Tuple, List, Set
+from fuse import FuseOSError, Operations, LoggingMixIn
+from web3 import Web3
 
 from .rpc_manager import RPCManager
 from .contract_manager import ContractManager
 
+logger = logging.getLogger(__name__)
+
+# EntryType enum values from contract
+ENTRY_TYPE_FILE = 0
+ENTRY_TYPE_DIRECTORY = 1
+ENTRY_TYPE_LINK = 2
+
 
 class EthFS(LoggingMixIn, Operations):
     """
-    FUSE filesystem backed by Ethereum smart contracts
-    
-    Structure:
-    - Root: Lists chain IDs as directories
-    - Chain level: Lists account addresses as directories
-    - Account level: User files and directories stored in smart contract
+    FUSE filesystem backed by Ethereum smart contract
+    Path structure: /CHAIN_ID/ACCOUNT_ADDRESS/path/to/file
     """
     
     def __init__(self, contract_addresses: Dict[int, str]):
@@ -35,26 +31,34 @@ class EthFS(LoggingMixIn, Operations):
         Initialize the filesystem
         
         Args:
-            contract_addresses: Mapping of chain_id -> contract_address
+            contract_addresses: Dictionary mapping chain_id to contract address
         """
+        self.contract_addresses = contract_addresses
         self.rpc_manager = RPCManager()
-        self.contract_managers: Dict[int, ContractManager] = {}
         
         # Initialize contract managers for each chain
-        for chain_id in self.rpc_manager.get_all_chain_ids():
-            if chain_id in contract_addresses:
-                w3 = self.rpc_manager.get_connection(chain_id)
-                self.contract_managers[chain_id] = ContractManager(
-                    w3, contract_addresses[chain_id]
-                )
+        self.contract_managers: Dict[int, ContractManager] = {}
+        for chain_id, address in contract_addresses.items():
+            w3 = self.rpc_manager.get_connection(chain_id)
+            if w3 is None:
+                logger.warning(f"Could not connect to chain {chain_id}, skipping")
+                continue
+            self.contract_managers[chain_id] = ContractManager(w3, address)
         
-        # Default account for writes (should be configurable)
-        self.default_account = os.environ.get('ETH_ACCOUNT', '0x0000000000000000000000000000000000000000')
+        # Cache for directory listings and file metadata
+        # Maps (chain_id, account, path) -> entry_info
+        self.entry_cache: Dict[Tuple[int, str, str], dict] = {}
+        # Maps (chain_id, account) -> Set[storage_slot]
+        self.slot_cache: Dict[Tuple[int, str], Set[int]] = {}
         
-        # In-memory cache for directory structure
-        self.dir_cache = {}
+        # Get current process uid/gid for default permissions
+        self.default_uid = os.getuid()
+        self.default_gid = os.getgid()
+        
+        # Build initial cache
+        self._refresh_cache()
     
-    def _parse_path(self, path: str) -> tuple:
+    def _parse_path(self, path: str) -> Tuple[Optional[int], Optional[str], Optional[str]]:
         """
         Parse a path into its components
         
@@ -84,437 +88,510 @@ class EthFS(LoggingMixIn, Operations):
         relative_path = '/'.join(parts[2:])
         return (chain_id, account, relative_path)
     
-    def _get_storage_slot_for_path(self, chain_id: int, account: str, rel_path: str) -> Optional[int]:
-        """Get storage slot for a given path using ContractManager's mapping"""
-        if chain_id not in self.contract_managers:
-            return None
-        contract_mgr = self.contract_managers[chain_id]
-        # Use ContractManager's internal mapping to get storage slot
-        key = (account.lower(), rel_path)
-        if key in contract_mgr.path_to_slot:
-            return contract_mgr.path_to_slot[key]
-        return None
-    
-    def _find_entry_by_path(self, chain_id: int, account: str, rel_path: str) -> Optional[tuple]:
-        """
-        Find an entry by path using IFileSystem.getEntries() and getEntry()
-        Returns: (storage_slot, entry_info) or None
-        """
-        if chain_id not in self.contract_managers:
-            return None
+    def _refresh_cache(self):
+        """Refresh the cache by querying all entries from contracts"""
+        self.entry_cache.clear()
+        self.slot_cache.clear()
         
-        contract_mgr = self.contract_managers[chain_id]
-        contract = contract_mgr.contract
-        
-        # First try to get storage slot from mapping
-        storage_slot = self._get_storage_slot_for_path(chain_id, account, rel_path)
-        if storage_slot is not None:
+        for chain_id, contract_manager in self.contract_managers.items():
             try:
-                entry = contract.functions.getEntry(storage_slot).call()
-                entry_type, owner, name, body, timestamp, entry_exists, file_size, dir_target = entry
-                if entry_exists and owner.lower() == account.lower():
-                    # Verify the name matches (for files)
-                    if entry_type == 0:  # FILE
-                        filename = rel_path.split('/')[-1] if '/' in rel_path else rel_path
-                        if name.decode('utf-8', errors='ignore') == filename:
-                            return (storage_slot, entry)
-                    else:  # DIRECTORY
-                        # For directories, we need to check if the path matches
-                        # This is a simplified check - in practice, directory structure
-                        # might need more sophisticated matching
-                        return (storage_slot, entry)
-            except Exception:
-                pass
+                # Get all storage slots
+                slots = contract_manager.contract.functions.getEntries().call()
+                
+                for slot in slots:
+                    try:
+                        entry = contract_manager.contract.functions.getEntry(slot).call()
+                        entry_type, owner, name_bytes, body, timestamp, exists, file_size, dir_target = entry
+                        
+                        if not exists:
+                            continue
+                        
+                        owner_lower = owner.lower()
+                        if (chain_id, owner_lower) not in self.slot_cache:
+                            self.slot_cache[(chain_id, owner_lower)] = set()
+                        self.slot_cache[(chain_id, owner_lower)].add(slot)
+                        
+                        # Build path from entry name (which stores the full path)
+                        # Both files and directories now store their names
+                        if name_bytes:
+                            try:
+                                full_path = name_bytes.decode('utf-8')
+                                # Store entry info with full path
+                                self.entry_cache[(chain_id, owner_lower, full_path)] = {
+                                    'slot': slot,
+                                    'type': entry_type,
+                                    'owner': owner,
+                                    'size': file_size,
+                                    'timestamp': timestamp,
+                                    'name': full_path.split('/')[-1] if '/' in full_path else full_path
+                                }
+                            except UnicodeDecodeError:
+                                logger.warning(f"Could not decode name for slot {slot}")
+                    except Exception as e:
+                        logger.debug(f"Error processing slot {slot} on chain {chain_id}: {e}")
+            except Exception as e:
+                logger.error(f"Error refreshing cache for chain {chain_id}: {e}")
+    
+    def _get_entry_info(self, chain_id: int, account: str, path: str) -> Optional[dict]:
+        """Get entry information from cache or contract"""
+        account_lower = account.lower()
         
-        # If not found in mapping, search all entries
+        # Check cache first
+        if (chain_id, account_lower, path) in self.entry_cache:
+            return self.entry_cache[(chain_id, account_lower, path)]
+        
+        # Try to get from contract
+        if chain_id not in self.contract_managers:
+            return None
+        
+        contract_manager = self.contract_managers[chain_id]
+        
+        # Check if it's a directory by checking if any files start with this path
+        # This is a fallback for directories that might not be in cache yet
+        if path and not path.endswith('/'):
+            # Check if this is a directory
+            dir_path = path + '/'
+            for (c_id, acc, file_path) in self.entry_cache.keys():
+                if c_id == chain_id and acc == account_lower and file_path.startswith(dir_path):
+                    return {
+                        'type': ENTRY_TYPE_DIRECTORY,
+                        'owner': account,
+                        'size': 0,
+                        'timestamp': int(time.time()),
+                        'name': path.split('/')[-1] if '/' in path else path
+                    }
+        
+        # Try to get entry from contract
         try:
-            all_slots = contract.functions.getEntries().call()
-            account_lower = account.lower()
-            filename = rel_path.split('/')[-1] if '/' in rel_path else rel_path
-            
-            for slot in all_slots:
-                try:
-                    entry = contract.functions.getEntry(slot).call()
-                    entry_type, owner, name_bytes, body, timestamp, entry_exists, file_size, dir_target = entry
-                    
-                    if entry_exists and owner.lower() == account_lower:
-                        # For files, check if name matches
-                        if entry_type == 0:  # FILE
-                            entry_name = name_bytes.decode('utf-8', errors='ignore')
-                            if entry_name == filename:
-                                # Update mapping for future lookups
-                                key = (account.lower(), rel_path)
-                                contract_mgr.path_to_slot[key] = slot
-                                contract_mgr.slot_to_path[(account.lower(), slot)] = rel_path
-                                return (slot, entry)
-                        # For directories, we'd need more sophisticated matching
-                        # For now, skip directories in this search
-                except Exception:
-                    continue
-        except Exception:
-            pass
+            entry = contract_manager.get_entry(account, path)
+            if entry:
+                entry_type, owner, name_bytes, body, timestamp, exists, file_size, dir_target = entry
+                if exists:
+                    # Find the slot
+                    slot = contract_manager._find_slot_by_path(account, path)
+                    info = {
+                        'slot': slot,
+                        'type': entry_type,
+                        'owner': owner,
+                        'size': file_size,
+                        'timestamp': timestamp,
+                        'name': path.split('/')[-1] if '/' in path else path
+                    }
+                    # Cache it
+                    self.entry_cache[(chain_id, account_lower, path)] = info
+                    return info
+        except Exception as e:
+            logger.debug(f"Error getting entry for {path}: {e}")
         
         return None
     
-    def getattr(self, path, fh=None):
-        """Get file attributes"""
-
-        print(f"Getting attributes for path: {path}")
-        chain_id, account, rel_path = self._parse_path(path)
-        print(f"Parsed path: {chain_id}, {account}, {rel_path}")
-        # Root directory
-        if chain_id is None:
-            return dict(
-                st_mode=(stat.S_IFDIR | 0o755),
-                st_nlink=2,
-                st_ctime=time.time(),
-                st_mtime=time.time(),
-                st_atime=time.time()
-            )
-        
-        # Chain ID directory
-        if account is None:
-            if chain_id in self.rpc_manager.get_all_chain_ids():
-                return dict(
-                    st_mode=(stat.S_IFDIR | 0o755),
-                    st_nlink=2,
-                    st_ctime=time.time(),
-                    st_mtime=time.time(),
-                    st_atime=time.time()
-                )
-            raise FuseOSError(errno.ENOENT)
-        
-        # Account directory - always a directory that lists entries
-        if rel_path is None:
-            # The account level is always a directory that contains entries
-            return dict(
-                st_mode=(stat.S_IFDIR | 0o755),
-                st_nlink=2,
-                st_ctime=time.time(),
-                st_mtime=time.time(),
-                st_atime=time.time()
-            )
-        # File or directory in contract storage - use IFileSystem.getEntry()
-        result = self._find_entry_by_path(chain_id, account, rel_path)
-        print(f"Result: {result}")
-        if result is None:
-            raise FuseOSError(errno.ENOENT)
-        
-        storage_slot, entry = result
-        entry_type, owner, name, body, timestamp, entry_exists, file_size, dir_target = entry
-        
-        print(f"Entry type: {entry_type}")
-        print(f"Entry exists: {entry_exists}")
-        if not entry_exists:
-            raise FuseOSError(errno.ENOENT)
-        
-        print(f"Entry type: {entry_type}")
-        if entry_type == 1:  # DIRECTORY
-            return dict(
-                st_mode=(stat.S_IFDIR | 0o755),
-                st_nlink=2,
-                st_ctime=timestamp,
-                st_mtime=timestamp,
-                st_atime=timestamp
-            )
-        else:  # FILE
-            return dict(
-                st_mode=(stat.S_IFREG | 0o644),
-                st_nlink=1,
-                st_size=file_size,
-                st_ctime=timestamp,
-                st_mtime=timestamp,
-                st_atime=timestamp
-            )
-    
-    def readdir(self, path, fh):
-        """Read directory contents using IFileSystem.getEntries() and getEntry()"""
-        chain_id, account, rel_path = self._parse_path(path)
-        entries = ['.', '..']
-        
-        # Root directory - list chain IDs
-        if chain_id is None:
-            for cid in self.rpc_manager.get_all_chain_ids():
-                entries.append(str(cid))
-            return entries
-        
-        # Chain directory - list accounts (for demo, return default account)
-        if account is None:
-            # In a real implementation, you'd query the blockchain for accounts
-            # For now, we'll show the default account
-            entries.append(self.default_account)
-            return entries
-        
-        # Account directory or subdirectory - use IFileSystem.getEntries()
+    def _get_contract_manager(self, chain_id: int, account: str) -> Optional[ContractManager]:
+        """Get contract manager and ensure account is set up"""
         if chain_id not in self.contract_managers:
-            return entries
-        
-        contract_mgr = self.contract_managers[chain_id]
-        contract = contract_mgr.contract
-        
-        try:
-            # Get all storage slots using IFileSystem.getEntries()
-            print(f"Getting all storage slots for account: {account}", contract.address)
-            print(contract.functions)
-            print(contract.functions.getEntries)
-            print(contract.functions.getEntries().call())
-            all_slots = contract.functions.getEntries().call()
-            account_lower = account.lower()
-            
-            # Determine the current directory prefix
-            if rel_path is None:
-                current_prefix = ""
-            else:
-                current_prefix = rel_path + "/"
-            
-            seen = set()
-            
-            # Iterate through all entries and filter by owner
-            for slot in all_slots:
-                try:
-                    # Use IFileSystem.getEntry() to get entry information
-                    entry = contract.functions.getEntry(slot).call()
-                    entry_type, owner, name_bytes, body, timestamp, entry_exists, file_size, dir_target = entry
-                    print(f"Entry: {entry}")
-                    print(f"Entry type: {entry_type}")
-                    print(f"Owner: {owner}")
-                    print(f"Name: {name_bytes}")
-                    print(f"Body: {body}")
-                    print(f"Timestamp: {timestamp}")
-                    print(f"Entry exists: {entry_exists}")
-                    print(f"File size: {file_size}")
-                    print(f"Directory target: {dir_target}")
-                    if not entry_exists:
-                        continue
-                    
-                    # Try to get path from mapping first
-                    path_for_slot = contract_mgr._get_path_from_slot(account, slot)
-                    print(f"Path for slot: {path_for_slot}")
-                    if path_for_slot is None:
-                        # No mapping exists - this happens for entries created outside our mapping
-                        # For files, use the name directly
-                        if entry_type == 0:  # FILE
-                            entry_name = name_bytes.decode('utf-8', errors='ignore')
-                            if entry_name and current_prefix == "":
-                                # Root level - use entry name directly
-                                if entry_name not in seen:
-                                    seen.add(entry_name)
-                                    entries.append(entry_name)
-                                    # Update mapping for future lookups
-                                    key = (account.lower(), entry_name)
-                                    contract_mgr.path_to_slot[key] = slot
-                                    contract_mgr.slot_to_path[(account.lower(), slot)] = entry_name
-                        # For directories without mapping, use slot number as name
-                        elif entry_type == 1:  # DIRECTORY
-                            if current_prefix == "":
-                                # Root level - use slot number as directory name
-                                dir_name = f"dir_{slot}"
-                                if dir_name not in seen:
-                                    seen.add(dir_name)
-                                    entries.append(dir_name)
-                                    # Update mapping
-                                    key = (account.lower(), dir_name)
-                                    contract_mgr.path_to_slot[key] = slot
-                                    contract_mgr.slot_to_path[(account.lower(), slot)] = dir_name
-                        continue
-                    
-                    print(f"Path for slot: {path_for_slot}")
-                    print(f"Current prefix: {current_prefix}")
-                    # Check if this path is a direct child of current path
-                    if current_prefix and not path_for_slot.startswith(current_prefix):
-                        continue
-                    
-                    # Get the relative part
-                    if current_prefix:
-                        rel = path_for_slot[len(current_prefix):]
-                    else:
-                        rel = path_for_slot
-                    
-                    # Get only direct children (first component of path)
-                    if '/' in rel:
-                        # This is a deeper path, just get the directory name
-                        child = rel.split('/')[0]
-                    else:
-                        child = rel
-                    
-                    if child and child not in seen:
-                        seen.add(child)
-                        entries.append(child)
-                        
-                except Exception as e:
-                    # Log error but continue processing other entries
-                    print(f"Error processing slot {slot}: {e}")
-                    continue
-                    
-        except Exception as e:
-            print(f"Error reading directory {path}: {e}")
-            pass
-        
-        return entries
+            return None
+        return self.contract_managers[chain_id]
     
-    def read(self, path, size, offset, fh):
-        """Read file content using IFileSystem.readFile()"""
-        chain_id, account, rel_path = self._parse_path(path)
-        print(f"Reading file content for path: {path}")
-        print(f"Parsed path: {chain_id}, {account}, {rel_path}")
-        if chain_id not in self.contract_managers or rel_path is None:
-            raise FuseOSError(errno.ENOENT)
+    def _list_directory(self, chain_id: int, account: str, path: str) -> List[str]:
+        """List directory contents"""
+        account_lower = account.lower()
+        entries = set()
         
-        # Find the entry to get storage slot
-        result = self._find_entry_by_path(chain_id, account, rel_path)
-        if result is None:
-            raise FuseOSError(errno.ENOENT)
-        
-        storage_slot, entry = result
-        entry_type, owner, name, body, timestamp, entry_exists, file_size, dir_target = entry
-        
-        if not entry_exists or entry_type != 0:  # Must be a file
-            raise FuseOSError(errno.ENOENT)
-        
-        # Use IFileSystem.readFile() to read the file content
-        contract_mgr = self.contract_managers[chain_id]
-        contract = contract_mgr.contract
-        
-        try:
-            print(f"Reading file content for path: {path}")
-            print(f"Storage slot: {storage_slot}")
-            print(f"Offset: {offset}")
-            print(f"Length: {length}")
-            print(f"File size: {file_size}")
-            print(f"Contract: {contract.address}")
-            print(contract.functions)
-            print(contract.functions.readFile)
-            # Read the requested portion using readFile
-            # If size is 0 or very large, read the entire remaining file
-            length = size if size > 0 else (file_size - offset)
-            if offset + length > file_size:
-                length = file_size - offset if offset < file_size else 0
-            
-            if length <= 0:
-                return b''
-            
-            body = contract.functions.readFile(storage_slot, offset, length).call()
-            return body
-        except Exception as e:
-            # Fallback to getting full entry if readFile fails
-            body = entry[3]  # body is at index 3
-            return body[offset:offset + size]
-    
-    def write(self, path, data, offset, fh):
-        """
-        Write to file
-        
-        Note: Partial writes (offset > 0) are inefficient as they require reading
-        the entire file from the blockchain before writing. For production use,
-        consider implementing a caching layer or documenting this limitation.
-        """
-        chain_id, account, rel_path = self._parse_path(path)
-        
-        if chain_id not in self.contract_managers or rel_path is None:
-            raise FuseOSError(errno.ENOENT)
-        
-        contract_mgr = self.contract_managers[chain_id]
-        
-        # Store the original data length for return value
-        bytes_to_write = len(data)
-        
-        # Handle partial writes by reading existing body and merging
-        # WARNING: This is expensive as it reads the entire file from blockchain
-        if offset != 0:
-            entry = contract_mgr.get_entry(account, rel_path)
-            if entry and entry[5]:  # entry[5] is 'entryExists'
-                existing = bytearray(entry[3])  # body is at index 3
-                # Extend the buffer if offset is beyond current length
-                if offset + len(data) > len(existing):
-                    existing.extend(b'\0' * (offset + len(data) - len(existing)))
-                # Write data at the specified offset
-                existing[offset:offset + len(data)] = data
-                data = bytes(existing)
-            else:
-                # File doesn't exist, create with padding
-                data = b'\0' * offset + data
-        
-        # Update the file
-        if contract_mgr.exists(account, rel_path):
-            contract_mgr.update_file(rel_path, data, account)
+        # If path is empty, list all top-level files/directories for this account
+        if not path:
+            for (c_id, acc, file_path), entry_info in self.entry_cache.items():
+                if c_id == chain_id :
+                    # Get the first component of the path
+                    if '/' in file_path:
+                        first_part = file_path.split('/')[0]
+                        entries.add(first_part)
+                    else:
+                        entries.add(file_path)
         else:
-            contract_mgr.create_file(rel_path, data, account)
+            # List files and directories in this directory
+            prefix = path + '/'
+            for (c_id, acc, file_path), entry_info in self.entry_cache.items():
+                if c_id == chain_id and file_path.startswith(prefix):
+                    # Get the next component after the prefix
+                    remaining = file_path[len(prefix):]
+                    if remaining:
+                        next_part = remaining.split('/')[0]
+                        entries.add(next_part)
         
-        # Return the number of bytes written (not the total file size)
-        return bytes_to_write
+        return sorted(list(entries))
     
-    def create(self, path, mode):
-        """Create a new file"""
+    # FUSE Operations
+    
+    def access(self, path: str, mode: int) -> int:
+        """Check file access permissions"""
         chain_id, account, rel_path = self._parse_path(path)
         
-        if chain_id not in self.contract_managers or rel_path is None:
-            raise FuseOSError(errno.ENOENT)
+        if chain_id is None:
+            # Root directory - always accessible
+            return 0
         
-        contract_mgr = self.contract_managers[chain_id]
-        contract_mgr.create_file(rel_path, b'', account)
+        if account is None:
+            # Chain directory - always accessible
+            return 0
+        
+        if rel_path is None:
+            # Account directory - always accessible
+            return 0
+        
+        # Check if entry exists
+        entry_info = self._get_entry_info(chain_id, account, rel_path)
+        if entry_info is None:
+            raise FuseOSError(os.ENOENT)
         
         return 0
     
-    def mkdir(self, path, mode):
+    def chmod(self, path: str, mode: int) -> int:
+        """Change file mode (not supported - permissions are on-chain)"""
+        # Permissions are managed by the contract owner, not filesystem permissions
+        return 0
+    
+    def chown(self, path: str, uid: int, gid: int) -> int:
+        """Change file ownership (not supported - ownership is on-chain)"""
+        # Ownership is managed by the contract, not filesystem
+        return 0
+    
+    def create(self, path: str, mode: int, fi=None) -> int:
+        """Create a file"""
+        chain_id, account, rel_path = self._parse_path(path)
+        
+        if chain_id is None or account is None or rel_path is None:
+            raise FuseOSError(os.EINVAL)
+        
+        contract_manager = self._get_contract_manager(chain_id, account)
+        if contract_manager is None:
+            raise FuseOSError(os.EIO)
+        
+        # Create empty file
+        filename = rel_path.split('/')[-1]
+        try:
+            success = contract_manager.create_file(rel_path, b'', account)
+            if success:
+                # Refresh cache
+                self._refresh_cache()
+                return 0
+            else:
+                raise FuseOSError(os.EIO)
+        except Exception as e:
+            logger.error(f"Error creating file {path}: {e}")
+            raise FuseOSError(os.EIO)
+    
+    def getattr(self, path: str, fh=None) -> dict:
+        """Get file attributes"""
+        chain_id, account, rel_path = self._parse_path(path)
+        
+        # Root directory
+        if chain_id is None:
+            return {
+                'st_mode': stat.S_IFDIR | 0o755,
+                'st_nlink': 2,
+                'st_size': 0,
+                'st_ctime': time.time(),
+                'st_mtime': time.time(),
+                'st_atime': time.time(),
+                'st_uid': self.default_uid,
+                'st_gid': self.default_gid,
+            }
+        
+        # Chain directory
+        if account is None:
+            return {
+                'st_mode': stat.S_IFDIR | 0o755,
+                'st_nlink': 2,
+                'st_size': 0,
+                'st_ctime': time.time(),
+                'st_mtime': time.time(),
+                'st_atime': time.time(),
+                'st_uid': self.default_uid,
+                'st_gid': self.default_gid,
+            }
+        
+        # Account directory
+        if rel_path is None:
+            return {
+                'st_mode': stat.S_IFDIR | 0o755,
+                'st_nlink': 2,
+                'st_size': 0,
+                'st_ctime': time.time(),
+                'st_mtime': time.time(),
+                'st_atime': time.time(),
+                'st_uid': self.default_uid,
+                'st_gid': self.default_gid,
+            }
+        
+        # Get entry info
+        entry_info = self._get_entry_info(chain_id, account, rel_path)
+        
+        if entry_info is None:
+            # Check if it's a directory by checking for sub-entries
+            # A path is a directory if there are files that start with path + '/'
+            account_lower = account.lower()
+            dir_path = rel_path + '/' if rel_path else ''
+            is_directory = False
+            for (c_id, acc, file_path) in self.entry_cache.keys():
+                if c_id == chain_id and acc == account_lower:
+                    if file_path.startswith(dir_path) and file_path != rel_path:
+                        is_directory = True
+                        break
+            
+            if is_directory:
+                return {
+                    'st_mode': stat.S_IFDIR | 0o755,
+                    'st_nlink': 2,
+                    'st_size': 0,
+                    'st_ctime': time.time(),
+                    'st_mtime': time.time(),
+                    'st_atime': time.time(),
+                    'st_uid': self.default_uid,
+                    'st_gid': self.default_gid,
+                }
+            raise FuseOSError(os.ENOENT)
+        
+        # Determine file type
+        if entry_info['type'] == ENTRY_TYPE_DIRECTORY:
+            st_mode = stat.S_IFDIR | 0o755
+        else:
+            st_mode = stat.S_IFREG | 0o644
+        
+        return {
+            'st_mode': st_mode,
+            'st_nlink': 1,
+            'st_size': entry_info.get('size', 0),
+            'st_ctime': entry_info.get('timestamp', time.time()),
+            'st_mtime': entry_info.get('timestamp', time.time()),
+            'st_atime': time.time(),
+            'st_uid': self.default_uid,
+            'st_gid': self.default_gid,
+        }
+    
+    def mkdir(self, path: str, mode: int) -> int:
         """Create a directory"""
         chain_id, account, rel_path = self._parse_path(path)
         
-        if chain_id not in self.contract_managers or rel_path is None:
-            raise FuseOSError(errno.ENOENT)
+        if chain_id is None or account is None or rel_path is None:
+            raise FuseOSError(os.EINVAL)
         
-        contract_mgr = self.contract_managers[chain_id]
-        contract_mgr.create_directory(rel_path, account)
+        contract_manager = self._get_contract_manager(chain_id, account)
+        if contract_manager is None:
+            raise FuseOSError(os.EIO)
+        
+        try:
+            # Create directory (using address(0) for organizational directories)
+            success = contract_manager.create_directory(rel_path, account)
+            if success:
+                # Refresh cache
+                self._refresh_cache()
+                return 0
+            else:
+                raise FuseOSError(os.EIO)
+        except Exception as e:
+            logger.error(f"Error creating directory {path}: {e}")
+            raise FuseOSError(os.EIO)
     
-    def unlink(self, path):
-        """Delete a file"""
+    def open(self, path: str, flags: int) -> int:
+        """Open a file"""
         chain_id, account, rel_path = self._parse_path(path)
         
-        if chain_id not in self.contract_managers or rel_path is None:
-            raise FuseOSError(errno.ENOENT)
+        if chain_id is None or account is None or rel_path is None:
+            raise FuseOSError(os.EINVAL)
         
-        contract_mgr = self.contract_managers[chain_id]
-        contract_mgr.delete_entry(rel_path, account)
+        entry_info = self._get_entry_info(chain_id, account, rel_path)
+        if entry_info is None:
+            raise FuseOSError(os.ENOENT)
+        
+        if entry_info['type'] != ENTRY_TYPE_FILE:
+            raise FuseOSError(os.EISDIR)
+        
+        # Return a file handle (we don't need to track it, just return 0)
+        return 0
     
-    def rmdir(self, path):
+    def read(self, path: str, size: int, offset: int, fh) -> bytes:
+        """Read from a file"""
+        chain_id, account, rel_path = self._parse_path(path)
+        
+        if chain_id is None or account is None or rel_path is None:
+            raise FuseOSError(os.EINVAL)
+        
+        contract_manager = self._get_contract_manager(chain_id, account)
+        if contract_manager is None:
+            raise FuseOSError(os.EIO)
+        
+        try:
+            data = contract_manager.read_file(rel_path, offset, size, account)
+            if data is None:
+                return b''
+            return data
+        except Exception as e:
+            logger.error(f"Error reading file {path}: {e}")
+            raise FuseOSError(os.EIO)
+    
+    def readdir(self, path: str, fh) -> List[str]:
+        """Read directory contents"""
+        chain_id, account, rel_path = self._parse_path(path)
+        
+        # Root directory - list chain IDs
+        if chain_id is None:
+            return ['.', '..'] + [str(cid) for cid in self.contract_managers.keys()]
+        
+        # Chain directory - list accounts
+        if account is None:
+            # Get all unique accounts for this chain
+            accounts = set()
+            for (c_id, acc, _) in self.entry_cache.keys():
+                if c_id == chain_id:
+                    accounts.add(acc)
+            return ['.', '..'] + sorted(list(accounts))
+        
+        # Account directory or subdirectory - list files
+        if rel_path is None:
+            rel_path = ''
+        
+        entries = self._list_directory(chain_id, account, rel_path)
+        return ['.', '..'] + entries
+    
+    def readlink(self, path: str) -> str:
+        """Read symbolic link target"""
+        raise FuseOSError(os.EINVAL)
+    
+    def rename(self, old: str, new: str) -> int:
+        """Rename a file or directory"""
+        # Not supported - would require updating the contract
+        raise FuseOSError(os.ENOSYS)
+    
+    def rmdir(self, path: str) -> int:
         """Remove a directory"""
         chain_id, account, rel_path = self._parse_path(path)
         
-        if chain_id not in self.contract_managers or rel_path is None:
-            raise FuseOSError(errno.ENOENT)
+        if chain_id is None or account is None or rel_path is None:
+            raise FuseOSError(os.EINVAL)
         
-        contract_mgr = self.contract_managers[chain_id]
-        contract_mgr.delete_entry(rel_path, account)
+        contract_manager = self._get_contract_manager(chain_id, account)
+        if contract_manager is None:
+            raise FuseOSError(os.EIO)
+        
+        # Check if directory is empty
+        entries = self._list_directory(chain_id, account, rel_path)
+        if entries:
+            raise FuseOSError(os.ENOTEMPTY)
+        
+        try:
+            success = contract_manager.delete_entry(rel_path, account)
+            if success:
+                # Refresh cache
+                self._refresh_cache()
+                return 0
+            else:
+                raise FuseOSError(os.EIO)
+        except Exception as e:
+            logger.error(f"Error removing directory {path}: {e}")
+            raise FuseOSError(os.EIO)
     
-    # Required FUSE operations
-    def chmod(self, path, mode):
-        """Change file mode - not supported, just return success"""
-        return 0
+    def statfs(self, path: str) -> dict:
+        """Get filesystem statistics"""
+        return {
+            'f_bsize': 4096,
+            'f_frsize': 4096,
+            'f_blocks': 1000000,
+            'f_bfree': 1000000,
+            'f_bavail': 1000000,
+            'f_files': 1000000,
+            'f_ffree': 1000000,
+            'f_favail': 1000000,
+            'f_flag': 0,
+            'f_namemax': 255,
+        }
     
-    def chown(self, path, uid, gid):
-        """Change file owner - not supported, just return success"""
-        return 0
+    def symlink(self, target: str, name: str) -> int:
+        """Create a symbolic link"""
+        raise FuseOSError(os.ENOSYS)
     
-    def utimens(self, path, times=None):
-        """Update file timestamps - not supported, just return success"""
-        return 0
-    
-    def truncate(self, path, length, fh=None):
-        """Truncate file to specified length"""
+    def truncate(self, path: str, length: int, fh=None) -> int:
+        """Truncate a file"""
+        # Truncation is handled by writing empty bytes
         chain_id, account, rel_path = self._parse_path(path)
         
-        if chain_id not in self.contract_managers or rel_path is None:
-            raise FuseOSError(errno.ENOENT)
+        if chain_id is None or account is None or rel_path is None:
+            raise FuseOSError(os.EINVAL)
         
-        contract_mgr = self.contract_managers[chain_id]
-        entry = contract_mgr.get_entry(account, rel_path)
+        contract_manager = self._get_contract_manager(chain_id, account)
+        if contract_manager is None:
+            raise FuseOSError(os.EIO)
         
-        if entry and entry[5]:  # entry[5] is 'entryExists'
-            body = entry[3]  # body is at index 3
-            if length < len(body):
-                new_body = body[:length]
-            else:
-                new_body = body + b'\0' * (length - len(body))
+        try:
+            # Read current file
+            current_data = contract_manager.read_file(rel_path, 0, 0, account)
+            if current_data is None:
+                current_data = b''
             
-            contract_mgr.update_file(rel_path, new_body, account)
+            if length < len(current_data):
+                # Truncate by writing only the first length bytes
+                truncated_data = current_data[:length]
+                success = contract_manager.write_file(rel_path, truncated_data, 0, account)
+            else:
+                # Extend with zeros
+                new_data = current_data + b'\x00' * (length - len(current_data))
+                success = contract_manager.write_file(rel_path, new_data, 0, account)
+            
+            if success:
+                # Refresh cache
+                self._refresh_cache()
+                return 0
+            else:
+                raise FuseOSError(os.EIO)
+        except Exception as e:
+            logger.error(f"Error truncating file {path}: {e}")
+            raise FuseOSError(os.EIO)
+    
+    def unlink(self, path: str) -> int:
+        """Remove a file"""
+        chain_id, account, rel_path = self._parse_path(path)
         
+        if chain_id is None or account is None or rel_path is None:
+            raise FuseOSError(os.EINVAL)
+        
+        contract_manager = self._get_contract_manager(chain_id, account)
+        if contract_manager is None:
+            raise FuseOSError(os.EIO)
+        
+        try:
+            success = contract_manager.delete_entry(rel_path, account)
+            if success:
+                # Refresh cache
+                self._refresh_cache()
+                return 0
+            else:
+                raise FuseOSError(os.EIO)
+        except Exception as e:
+            logger.error(f"Error removing file {path}: {e}")
+            raise FuseOSError(os.EIO)
+    
+    def utimens(self, path: str, times=None) -> int:
+        """Update file access and modification times"""
+        # Timestamps are managed by the contract
         return 0
+    
+    def write(self, path: str, data: bytes, offset: int, fh) -> int:
+        """Write to a file"""
+        chain_id, account, rel_path = self._parse_path(path)
+        
+        if chain_id is None or account is None or rel_path is None:
+            raise FuseOSError(os.EINVAL)
+        
+        contract_manager = self._get_contract_manager(chain_id, account)
+        if contract_manager is None:
+            raise FuseOSError(os.EIO)
+        
+        try:
+            success = contract_manager.write_file(rel_path, data, offset, account)
+            if success:
+                # Refresh cache
+                self._refresh_cache()
+                return len(data)
+            else:
+                raise FuseOSError(os.EIO)
+        except Exception as e:
+            logger.error(f"Error writing to file {path}: {e}")
+            raise FuseOSError(os.EIO)

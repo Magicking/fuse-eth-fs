@@ -443,15 +443,21 @@ contract FileSystem is IFileSystem {
     /**
      * @dev Create a new directory pointing to another IFileSystem contract (storage slot auto-assigned)
      */
-    function createDirectory(address target) public override {
-        require(target != address(0), "Invalid target address");
-        require(target != address(this), "Cannot point to self");
+    function createDirectory(bytes memory name, address target) public override {
+        // Allow address(0) for directories without a specific target (organizational directories)
+        // Only require non-zero if target is provided and not self
+        if (target != address(0)) {
+            require(target != address(this), "Cannot point to self");
+        }
         
         uint256 storageSlot = _getNextStorageSlot();
         uint256 metadataSlot = _getMetadataSlot(storageSlot);
         uint256 packed = _sload(metadataSlot);
         (, uint64 timestamp,) = _unpackMetadata(packed);
         require(timestamp == 0, "Entry already exists");
+        
+        // Store directory name
+        _writeFileName(storageSlot, name);
         
         uint256 newPacked = _packMetadata(
             EntryType.DIRECTORY,
@@ -586,10 +592,18 @@ contract FileSystem is IFileSystem {
             directoryTarget = address(uint160(_sload(targetSlot)));
         }
         
-        // Get file name and body if it's a file
-        if (entryExists && entryType == EntryType.FILE) {
-            name = _readFileName(storageSlot, 256);
-            body = _readFromClusters(storageSlot, 0, 0, uint32(fileSize));
+        // Get name and body based on entry type
+        if (entryExists) {
+            if (entryType == EntryType.FILE) {
+                name = _readFileName(storageSlot, 256);
+                body = _readFromClusters(storageSlot, 0, 0, uint32(fileSize));
+            } else if (entryType == EntryType.DIRECTORY) {
+                name = _readFileName(storageSlot, 256);
+                body = new bytes(0);
+            } else {
+                name = new bytes(0);
+                body = new bytes(0);
+            }
         } else {
             name = new bytes(0);
             body = new bytes(0);

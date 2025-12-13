@@ -61,7 +61,7 @@ contract FileSystemTest is Test {
 
     function testCreateDirectory() public {
         vm.prank(user1);
-        fs.createDirectory(address(fs2));
+        fs.createDirectory(bytes("mydir"), address(fs2));
         
         // Get the assigned slot (should be 0 for first entry)
         uint256[] memory entries = fs.getEntries();
@@ -82,7 +82,7 @@ contract FileSystemTest is Test {
         assertTrue(entryExists);
         assertEq(uint(entryType), uint(IFileSystem.EntryType.DIRECTORY));
         assertEq(owner, user1);
-        assertEq(name.length, 0);
+        assertEq(string(name), "mydir");
         assertEq(body.length, 0);
         assertEq(fileSize, 0);
         assertEq(directoryTarget, address(fs2));
@@ -114,11 +114,11 @@ contract FileSystemTest is Test {
 
     function testCannotCreateDuplicateDirectory() public {
         vm.startPrank(user1);
-        fs.createDirectory(address(fs2));
+        fs.createDirectory(bytes("dir1"), address(fs2));
         // Since slots are auto-assigned, we can't create a duplicate at the same slot
         // This test is no longer applicable - each createDirectory gets a new slot
         // Instead, test that we can create multiple directories
-        fs.createDirectory(address(fs3));
+        fs.createDirectory(bytes("dir2"), address(fs3));
         uint256[] memory entries = fs.getEntries();
         assertEq(entries.length, 2);
         vm.stopPrank();
@@ -126,11 +126,12 @@ contract FileSystemTest is Test {
 
     function testCannotCreateDirectoryWithInvalidTarget() public {
         vm.startPrank(user1);
-        vm.expectRevert("Invalid target address");
-        fs.createDirectory(address(0));
+        // address(0) is now allowed for organizational directories
+        fs.createDirectory(bytes("testdir"), address(0));
         
+        // But cannot point to self
         vm.expectRevert("Cannot point to self");
-        fs.createDirectory(address(fs));
+        fs.createDirectory(bytes("testdir2"), address(fs));
         vm.stopPrank();
     }
 
@@ -209,7 +210,7 @@ contract FileSystemTest is Test {
 
     function testCannotUpdateDirectory() public {
         vm.startPrank(user1);
-        fs.createDirectory(address(fs2));
+        fs.createDirectory(bytes("testdir"), address(fs2));
         uint256[] memory entries = fs.getEntries();
         slotDir1 = entries[0];
         
@@ -222,7 +223,7 @@ contract FileSystemTest is Test {
         vm.startPrank(user1);
         fs.createFile(bytes("file1.txt"), bytes("1"), 0);
         fs.createFile(bytes("file2.txt"), bytes("2"), 0);
-        fs.createDirectory(address(fs2));
+        fs.createDirectory(bytes("mydir"), address(fs2));
         vm.stopPrank();
 
         uint256[] memory entries = fs.getEntries();
@@ -327,7 +328,7 @@ contract FileSystemTest is Test {
     function testDirectoryPointsToFileSystem() public {
         vm.startPrank(user1);
         // Create a directory pointing to fs2
-        fs.createDirectory(address(fs2));
+        fs.createDirectory(bytes("testdir"), address(fs2));
         uint256[] memory entries = fs.getEntries();
         slotDir1 = entries[0];
         
@@ -337,11 +338,54 @@ contract FileSystemTest is Test {
         slotFile1 = entries2[0];
         
         // Get directory entry
-        (, , , , , , , address target) = fs.getEntry(slotDir1);
+        (, , bytes memory name, , , , , address target) = fs.getEntry(slotDir1);
+        assertEq(string(name), "testdir");
         assertEq(target, address(fs2));
         
         // Verify we can access fs2 through the directory
         assertTrue(fs2.exists(slotFile1));
+        vm.stopPrank();
+    }
+    
+    function testDirectoryNameStorage() public {
+        vm.startPrank(user1);
+        // Test creating directories with different names
+        fs.createDirectory(bytes("dir1"), address(fs2));
+        fs.createDirectory(bytes("dir2"), address(fs3));
+        fs.createDirectory(bytes("nested/dir"), address(fs2));
+        
+        uint256[] memory entries = fs.getEntries();
+        assertEq(entries.length, 3);
+        
+        // Verify each directory has the correct name
+        (, , bytes memory name1, , , , , ) = fs.getEntry(entries[0]);
+        (, , bytes memory name2, , , , , ) = fs.getEntry(entries[1]);
+        (, , bytes memory name3, , , , , ) = fs.getEntry(entries[2]);
+        
+        // Check that names are stored correctly (order may vary, so check all)
+        bool found1 = false;
+        bool found2 = false;
+        bool found3 = false;
+        
+        if (keccak256(name1) == keccak256(bytes("dir1")) || 
+            keccak256(name2) == keccak256(bytes("dir1")) || 
+            keccak256(name3) == keccak256(bytes("dir1"))) {
+            found1 = true;
+        }
+        if (keccak256(name1) == keccak256(bytes("dir2")) || 
+            keccak256(name2) == keccak256(bytes("dir2")) || 
+            keccak256(name3) == keccak256(bytes("dir2"))) {
+            found2 = true;
+        }
+        if (keccak256(name1) == keccak256(bytes("nested/dir")) || 
+            keccak256(name2) == keccak256(bytes("nested/dir")) || 
+            keccak256(name3) == keccak256(bytes("nested/dir"))) {
+            found3 = true;
+        }
+        
+        assertTrue(found1, "dir1 not found");
+        assertTrue(found2, "dir2 not found");
+        assertTrue(found3, "nested/dir not found");
         vm.stopPrank();
     }
     
@@ -417,13 +461,13 @@ contract FileSystemTest is Test {
         fs.createFile(bytes("config.txt"), bytes("debug=true\nport=8080\nhost=localhost\n"), 0);
         
         // Create directories in root
-        fs.createDirectory(address(publicDir));
-        fs.createDirectory(address(privateDir));
+        fs.createDirectory(bytes("public"), address(publicDir));
+        fs.createDirectory(bytes("private"), address(privateDir));
         
         // Create files in public directory
         publicDir.createFile(bytes("index.html"), bytes("<!DOCTYPE html>\n<html>\n<head><title>Home</title></head>\n<body><h1>Welcome</h1></body>\n</html>\n"), 0);
         publicDir.createFile(bytes("style.css"), bytes("body {\n  font-family: Arial, sans-serif;\n  margin: 20px;\n}\n"), 0);
-        publicDir.createDirectory(address(docsDir));
+        publicDir.createDirectory(bytes("docs"), address(docsDir));
         
         // Create files in docs subdirectory
         docsDir.createFile(bytes("api.md"), bytes("# API Documentation\n\n## Endpoints\n- GET /api/users\n- POST /api/users\n"), 0);
@@ -431,7 +475,7 @@ contract FileSystemTest is Test {
         
         // Create files in private directory
         privateDir.createFile(bytes("secrets.txt"), bytes("api_key=secret123\npassword=admin\n"), 0);
-        privateDir.createDirectory(address(imagesDir));
+        privateDir.createDirectory(bytes("images"), address(imagesDir));
         
         // Create files in images subdirectory
         imagesDir.createFile(bytes("logo.png"), bytes("PNG_IMAGE_DATA_HERE"), 0);
@@ -490,7 +534,8 @@ contract FileSystemTest is Test {
                 console.log(string(abi.encodePacked("      size: ", vm.toString(fileSize), ", slot: ", vm.toString(slot))));
                 console.log(string(abi.encodePacked("      content: ", string(body))));
             } else if (entryType == IFileSystem.EntryType.DIRECTORY) {
-                console.log(string(abi.encodePacked(prefix, indent, "[DIR]  slot: ", vm.toString(slot))));
+                string memory dirName = string(name);
+                console.log(string(abi.encodePacked(prefix, indent, "[DIR]  ", dirName, ", slot: ", vm.toString(slot))));
                 
                 // Recursively display directory contents
                 FileSystem targetFs = FileSystem(directoryTarget);
