@@ -123,7 +123,8 @@ class EthFS(LoggingMixIn, Operations):
                                     'owner': owner,
                                     'size': file_size,
                                     'timestamp': timestamp,
-                                    'name': full_path.split('/')[-1] if '/' in full_path else full_path
+                                    'name': full_path.split('/')[-1] if '/' in full_path else full_path,
+                                    'directory_target': dir_target if dir_target and dir_target != '0x0000000000000000000000000000000000000000' else None
                                 }
                             except UnicodeDecodeError:
                                 logger.warning(f"Could not decode name for slot {slot}")
@@ -144,7 +145,10 @@ class EthFS(LoggingMixIn, Operations):
         if chain_id not in self.contract_managers:
             return None
         
-        contract_manager = self.contract_managers[chain_id]
+        # First, try to resolve which contract to use for this path
+        contract_manager = self._get_contract_manager(chain_id, account, path)
+        if contract_manager is None:
+            return None
         
         # Check if it's a directory by checking if any files start with this path
         # This is a fallback for directories that might not be in cache yet
@@ -162,22 +166,26 @@ class EthFS(LoggingMixIn, Operations):
                     }
         
         # Try to get entry from contract
+        # Get relative path within subdirectory contract if needed
+        relative_path = self._get_relative_path_in_subdirectory(chain_id, account, path)
+        
         try:
-            entry = contract_manager.get_entry(account, path)
+            entry = contract_manager.get_entry(account, relative_path)
             if entry:
                 entry_type, owner, name_bytes, body, timestamp, exists, file_size, dir_target = entry
                 if exists:
                     # Find the slot
-                    slot = contract_manager._find_slot_by_path(account, path)
+                    slot = contract_manager._find_slot_by_path(account, relative_path)
                     info = {
                         'slot': slot,
                         'type': entry_type,
                         'owner': owner,
                         'size': file_size,
                         'timestamp': timestamp,
-                        'name': path.split('/')[-1] if '/' in path else path
+                        'name': path.split('/')[-1] if '/' in path else path,
+                        'directory_target': dir_target if dir_target and dir_target != '0x0000000000000000000000000000000000000000' else None
                     }
-                    # Cache it
+                    # Cache it with the original path (not relative path)
                     self.entry_cache[(chain_id, account_lower, path)] = info
                     return info
         except Exception as e:
@@ -185,21 +193,294 @@ class EthFS(LoggingMixIn, Operations):
         
         return None
     
-    def _get_contract_manager(self, chain_id: int, account: str) -> Optional[ContractManager]:
-        """Get contract manager and ensure account is set up"""
+    def _resolve_contract_address(self, chain_id: int, account: str, path: str) -> Optional[str]:
+        """
+        Resolve the contract address to use for a given path.
+        For directories: checks if the directory itself has a directoryTarget.
+        For files: walks up the directory tree to find if any parent directory has a directoryTarget.
+        Returns the directoryTarget address if found, otherwise returns the default contract address.
+        
+        NOTE: This method uses the default contract manager directly to avoid circular dependencies.
+        """
+        if chain_id not in self.contract_addresses:
+            return None
+        
+        # Start with the default contract address
+        default_address = self.contract_addresses[chain_id]
+        
+        # If path is empty, use default
+        if not path:
+            return default_address
+        
+        if chain_id not in self.contract_managers:
+            return default_address
+        
+        account_lower = account.lower()
+        default_contract_manager = self.contract_managers[chain_id]
+        
+        # First, check if the path itself is a directory with a directoryTarget
+        # This handles the case where we're listing a directory
+        cache_key = (chain_id, account_lower, path)
+        if cache_key in self.entry_cache:
+            entry_info = self.entry_cache[cache_key]
+            if entry_info and entry_info.get('type') == ENTRY_TYPE_DIRECTORY:
+                dir_target = entry_info.get('directory_target')
+                if dir_target:
+                    return dir_target
+        else:
+            # Try to get from default contract directly (avoiding circular dependency)
+            try:
+                entry = default_contract_manager.get_entry(account, path)
+                if entry:
+                    entry_type, owner, name_bytes, body, timestamp, exists, file_size, dir_target = entry
+                    if exists and entry_type == ENTRY_TYPE_DIRECTORY:
+                        if dir_target and dir_target != '0x0000000000000000000000000000000000000000':
+                            return dir_target
+            except Exception:
+                pass
+        
+        # If not a directory with target, walk up the directory tree to find parent with directoryTarget
+        path_parts = path.split('/')
+        # Check from the immediate parent up to the root
+        for i in range(len(path_parts) - 1, 0, -1):
+            parent_path = '/'.join(path_parts[:i])
+            cache_key = (chain_id, account_lower, parent_path)
+            
+            if cache_key in self.entry_cache:
+                entry_info = self.entry_cache[cache_key]
+                if entry_info and entry_info.get('type') == ENTRY_TYPE_DIRECTORY:
+                    dir_target = entry_info.get('directory_target')
+                    if dir_target:
+                        return dir_target
+            else:
+                # Try to get from default contract directly (avoiding circular dependency)
+                try:
+                    entry = default_contract_manager.get_entry(account, parent_path)
+                    if entry:
+                        entry_type, owner, name_bytes, body, timestamp, exists, file_size, dir_target = entry
+                        if exists and entry_type == ENTRY_TYPE_DIRECTORY:
+                            if dir_target and dir_target != '0x0000000000000000000000000000000000000000':
+                                return dir_target
+                except Exception:
+                    pass
+        
+        return default_address
+    
+    def _get_parent_directory_with_target(self, chain_id: int, account: str, path: str) -> Optional[Tuple[str, str]]:
+        """
+        Find the parent directory that has a directoryTarget for a given path.
+        Returns (parent_path, directory_target_address) if found, None otherwise.
+        
+        NOTE: This method uses the default contract manager directly to avoid circular dependencies.
+        """
+        if not path:
+            return None
+        
         if chain_id not in self.contract_managers:
             return None
-        return self.contract_managers[chain_id]
+        
+        account_lower = account.lower()
+        path_parts = path.split('/')
+        default_contract_manager = self.contract_managers[chain_id]
+        
+        # Walk up the directory tree to find parent with directoryTarget
+        for i in range(len(path_parts), 0, -1):
+            parent_path = '/'.join(path_parts[:i])
+            cache_key = (chain_id, account_lower, parent_path)
+            
+            if cache_key in self.entry_cache:
+                entry_info = self.entry_cache[cache_key]
+                if entry_info and entry_info.get('type') == ENTRY_TYPE_DIRECTORY:
+                    dir_target = entry_info.get('directory_target')
+                    if dir_target:
+                        return (parent_path, dir_target)
+            else:
+                # Try to get from default contract directly (avoiding circular dependency)
+                try:
+                    entry = default_contract_manager.get_entry(account, parent_path)
+                    if entry:
+                        entry_type, owner, name_bytes, body, timestamp, exists, file_size, dir_target = entry
+                        if exists and entry_type == ENTRY_TYPE_DIRECTORY:
+                            if dir_target and dir_target != '0x0000000000000000000000000000000000000000':
+                                return (parent_path, dir_target)
+                except Exception:
+                    pass
+        
+        return None
+    
+    def _get_relative_path_in_subdirectory(self, chain_id: int, account: str, path: str) -> str:
+        """
+        Get the relative path within a subdirectory contract.
+        If the path is within a directory that has a directoryTarget, returns the path relative to that directory.
+        Otherwise, returns the original path.
+        """
+        parent_info = self._get_parent_directory_with_target(chain_id, account, path)
+        if parent_info is None:
+            return path
+        
+        parent_path, _ = parent_info
+        if path.startswith(parent_path + '/'):
+            # Return the path relative to the parent directory
+            return path[len(parent_path + '/'):]
+        elif path == parent_path:
+            # The path itself is the directory with target
+            return ''
+        else:
+            return path
+    
+    def _get_contract_manager(self, chain_id: int, account: str, path: str = None) -> Optional[ContractManager]:
+        """
+        Get contract manager for the given path.
+        If path is a subdirectory within a directory that has a directoryTarget,
+        returns the contract manager for that target address.
+        """
+        if chain_id not in self.contract_managers:
+            return None
+        
+        # If no path specified, use default contract
+        if path is None:
+            return self.contract_managers[chain_id]
+        
+        # Resolve the contract address for this path
+        contract_address = self._resolve_contract_address(chain_id, account, path)
+        if contract_address is None:
+            return self.contract_managers[chain_id]
+        
+        # If it's the default contract, return the existing manager
+        default_address = self.contract_addresses.get(chain_id)
+        if contract_address.lower() == default_address.lower():
+            return self.contract_managers[chain_id]
+        
+        # Otherwise, we need to create/get a contract manager for this address
+        # Check if we already have one cached
+        cache_key = (chain_id, contract_address.lower())
+        if not hasattr(self, '_contract_manager_cache'):
+            self._contract_manager_cache: Dict[Tuple[int, str], ContractManager] = {}
+        
+        if cache_key in self._contract_manager_cache:
+            return self._contract_manager_cache[cache_key]
+        
+        # Create a new contract manager for this address
+        w3 = self.rpc_manager.get_connection(chain_id)
+        if w3 is None:
+            return self.contract_managers[chain_id]  # Fallback to default
+        
+        try:
+            new_manager = ContractManager(w3, contract_address)
+            self._contract_manager_cache[cache_key] = new_manager
+            return new_manager
+        except Exception as e:
+            logger.warning(f"Could not create contract manager for {contract_address}: {e}")
+            return self.contract_managers[chain_id]  # Fallback to default
     
     def _list_directory(self, chain_id: int, account: str, path: str) -> List[str]:
         """List directory contents"""
-        account_lower = account.lower()
         entries = set()
+        
+        # Check if the path itself is a directory with a directoryTarget
+        entry_info = self._get_entry_info(chain_id, account, path)
+        if entry_info and entry_info.get('type') == ENTRY_TYPE_DIRECTORY:
+            dir_target = entry_info.get('directory_target')
+            if dir_target:
+                # This directory has a directoryTarget, list entries from that contract
+                contract_manager = self._get_contract_manager(chain_id, account, path)
+                if contract_manager is None:
+                    return []
+                
+                try:
+                    slots = contract_manager.contract.functions.getEntries().call()
+                    account_lower = account.lower()
+                    for slot in slots:
+                        try:
+                            entry = contract_manager.contract.functions.getEntry(slot).call()
+                            entry_type, owner, name_bytes, body, timestamp, exists, file_size, dir_target = entry
+                            
+                            # Filter by account owner
+                            if exists and owner.lower() == account_lower:
+                                if name_bytes:
+                                    try:
+                                        entry_name = name_bytes.decode('utf-8')
+                                        # In subdirectory contracts, entries are stored with relative paths
+                                        # When listing the root of a subdirectory contract, show all top-level entries
+                                        if '/' in entry_name:
+                                            # Entry is in a subdirectory, get the first component
+                                            first_part = entry_name.split('/')[0]
+                                            entries.add(first_part)
+                                        else:
+                                            # Entry is at root level
+                                            entries.add(entry_name)
+                                    except UnicodeDecodeError:
+                                        pass
+                        except Exception:
+                            continue
+                    return sorted(list(entries))
+                except Exception as e:
+                    logger.debug(f"Error listing directory from subdirectory contract: {e}")
+                    return []
+        
+        # Get the contract manager for this path (may be different if parent has directoryTarget)
+        contract_manager = self._get_contract_manager(chain_id, account, path)
+        if contract_manager is None:
+            return []
+        
+        # Get the contract address being used
+        contract_address = self._resolve_contract_address(chain_id, account, path)
+        if contract_address is None:
+            return []
+        
+        # If we're using a different contract, we need to query that contract
+        default_address = self.contract_addresses.get(chain_id)
+        if contract_address.lower() != default_address.lower():
+            # We're using a subdirectory contract, query it directly
+            # Get relative path within the subdirectory contract
+            relative_path = self._get_relative_path_in_subdirectory(chain_id, account, path)
+            
+            try:
+                slots = contract_manager.contract.functions.getEntries().call()
+                account_lower = account.lower()
+                for slot in slots:
+                    try:
+                        entry = contract_manager.contract.functions.getEntry(slot).call()
+                        entry_type, owner, name_bytes, body, timestamp, exists, file_size, dir_target = entry
+                        
+                        # Filter by account owner
+                        if exists and owner.lower() == account_lower:
+                            if name_bytes:
+                                try:
+                                    entry_name = name_bytes.decode('utf-8')
+                                    # In subdirectory contracts, entries are stored with relative paths
+                                    # If relative_path is empty (listing root of subdirectory contract), show all top-level entries
+                                    if not relative_path:
+                                        # Get the first component of the path
+                                        if '/' in entry_name:
+                                            first_part = entry_name.split('/')[0]
+                                            entries.add(first_part)
+                                        else:
+                                            entries.add(entry_name)
+                                    else:
+                                        # We're listing a subdirectory within the subdirectory contract
+                                        # Check if entry is in this subdirectory
+                                        if entry_name.startswith(relative_path + '/'):
+                                            remaining = entry_name[len(relative_path + '/'):]
+                                            if remaining:
+                                                next_part = remaining.split('/')[0]
+                                                entries.add(next_part)
+                                        elif entry_name == relative_path:
+                                            # This is the directory itself, skip it
+                                            pass
+                                except UnicodeDecodeError:
+                                    pass
+                    except Exception:
+                        continue
+                return sorted(list(entries))
+            except Exception as e:
+                logger.debug(f"Error listing directory from subdirectory contract: {e}")
+                return []
         
         # If path is empty, list all top-level files/directories for this account
         if not path:
             for (c_id, acc, file_path), entry_info in self.entry_cache.items():
-                if c_id == chain_id :
+                if c_id == chain_id:
                     # Get the first component of the path
                     if '/' in file_path:
                         first_part = file_path.split('/')[0]
@@ -261,14 +542,16 @@ class EthFS(LoggingMixIn, Operations):
         if chain_id is None or account is None or rel_path is None:
             raise FuseOSError(os.EINVAL)
         
-        contract_manager = self._get_contract_manager(chain_id, account)
+        contract_manager = self._get_contract_manager(chain_id, account, rel_path)
         if contract_manager is None:
             raise FuseOSError(os.EIO)
         
+        # Get relative path within subdirectory contract if needed
+        relative_path = self._get_relative_path_in_subdirectory(chain_id, account, rel_path)
+        
         # Create empty file
-        filename = rel_path.split('/')[-1]
         try:
-            success = contract_manager.create_file(rel_path, b'', account)
+            success = contract_manager.create_file(relative_path, b'', account)
             if success:
                 # Refresh cache
                 self._refresh_cache()
@@ -353,6 +636,18 @@ class EthFS(LoggingMixIn, Operations):
         # Determine file type
         if entry_info['type'] == ENTRY_TYPE_DIRECTORY:
             st_mode = stat.S_IFDIR | 0o755
+            # For directories with directoryTarget, use the directory's own attributes
+            # (the attributes from the parent directory entry that has the directoryTarget)
+            return {
+                'st_mode': st_mode,
+                'st_nlink': 2,
+                'st_size': 0,
+                'st_ctime': entry_info.get('timestamp', time.time()),
+                'st_mtime': entry_info.get('timestamp', time.time()),
+                'st_atime': time.time(),
+                'st_uid': self.default_uid,
+                'st_gid': self.default_gid,
+            }
         else:
             st_mode = stat.S_IFREG | 0o644
         
@@ -374,13 +669,16 @@ class EthFS(LoggingMixIn, Operations):
         if chain_id is None or account is None or rel_path is None:
             raise FuseOSError(os.EINVAL)
         
-        contract_manager = self._get_contract_manager(chain_id, account)
+        contract_manager = self._get_contract_manager(chain_id, account, rel_path)
         if contract_manager is None:
             raise FuseOSError(os.EIO)
         
+        # Get relative path within subdirectory contract if needed
+        relative_path = self._get_relative_path_in_subdirectory(chain_id, account, rel_path)
+        
         try:
             # Create directory (using address(0) for organizational directories)
-            success = contract_manager.create_directory(rel_path, account)
+            success = contract_manager.create_directory(relative_path, account)
             if success:
                 # Refresh cache
                 self._refresh_cache()
@@ -415,12 +713,15 @@ class EthFS(LoggingMixIn, Operations):
         if chain_id is None or account is None or rel_path is None:
             raise FuseOSError(os.EINVAL)
         
-        contract_manager = self._get_contract_manager(chain_id, account)
+        contract_manager = self._get_contract_manager(chain_id, account, rel_path)
         if contract_manager is None:
             raise FuseOSError(os.EIO)
         
+        # Get relative path within subdirectory contract if needed
+        relative_path = self._get_relative_path_in_subdirectory(chain_id, account, rel_path)
+        
         try:
-            data = contract_manager.read_file(rel_path, offset, size, account)
+            data = contract_manager.read_file(relative_path, offset, size, account)
             if data is None:
                 return b''
             return data
@@ -448,7 +749,7 @@ class EthFS(LoggingMixIn, Operations):
         # Account directory or subdirectory - list files
         if rel_path is None:
             rel_path = ''
-        
+
         entries = self._list_directory(chain_id, account, rel_path)
         return ['.', '..'] + entries
     
@@ -468,7 +769,7 @@ class EthFS(LoggingMixIn, Operations):
         if chain_id is None or account is None or rel_path is None:
             raise FuseOSError(os.EINVAL)
         
-        contract_manager = self._get_contract_manager(chain_id, account)
+        contract_manager = self._get_contract_manager(chain_id, account, rel_path)
         if contract_manager is None:
             raise FuseOSError(os.EIO)
         
@@ -477,6 +778,8 @@ class EthFS(LoggingMixIn, Operations):
         if entries:
             raise FuseOSError(os.ENOTEMPTY)
         
+        # For directories, we delete the directory entry itself (not using relative path)
+        # because the directory entry is in the parent contract
         try:
             success = contract_manager.delete_entry(rel_path, account)
             if success:
@@ -516,24 +819,27 @@ class EthFS(LoggingMixIn, Operations):
         if chain_id is None or account is None or rel_path is None:
             raise FuseOSError(os.EINVAL)
         
-        contract_manager = self._get_contract_manager(chain_id, account)
+        contract_manager = self._get_contract_manager(chain_id, account, rel_path)
         if contract_manager is None:
             raise FuseOSError(os.EIO)
         
+        # Get relative path within subdirectory contract if needed
+        relative_path = self._get_relative_path_in_subdirectory(chain_id, account, rel_path)
+        
         try:
             # Read current file
-            current_data = contract_manager.read_file(rel_path, 0, 0, account)
+            current_data = contract_manager.read_file(relative_path, 0, 0, account)
             if current_data is None:
                 current_data = b''
             
             if length < len(current_data):
                 # Truncate by writing only the first length bytes
                 truncated_data = current_data[:length]
-                success = contract_manager.write_file(rel_path, truncated_data, 0, account)
+                success = contract_manager.write_file(relative_path, truncated_data, 0, account)
             else:
                 # Extend with zeros
                 new_data = current_data + b'\x00' * (length - len(current_data))
-                success = contract_manager.write_file(rel_path, new_data, 0, account)
+                success = contract_manager.write_file(relative_path, new_data, 0, account)
             
             if success:
                 # Refresh cache
@@ -552,12 +858,15 @@ class EthFS(LoggingMixIn, Operations):
         if chain_id is None or account is None or rel_path is None:
             raise FuseOSError(os.EINVAL)
         
-        contract_manager = self._get_contract_manager(chain_id, account)
+        contract_manager = self._get_contract_manager(chain_id, account, rel_path)
         if contract_manager is None:
             raise FuseOSError(os.EIO)
         
+        # Get relative path within subdirectory contract if needed
+        relative_path = self._get_relative_path_in_subdirectory(chain_id, account, rel_path)
+        
         try:
-            success = contract_manager.delete_entry(rel_path, account)
+            success = contract_manager.delete_entry(relative_path, account)
             if success:
                 # Refresh cache
                 self._refresh_cache()
@@ -580,12 +889,15 @@ class EthFS(LoggingMixIn, Operations):
         if chain_id is None or account is None or rel_path is None:
             raise FuseOSError(os.EINVAL)
         
-        contract_manager = self._get_contract_manager(chain_id, account)
+        contract_manager = self._get_contract_manager(chain_id, account, rel_path)
         if contract_manager is None:
             raise FuseOSError(os.EIO)
         
+        # Get relative path within subdirectory contract if needed
+        relative_path = self._get_relative_path_in_subdirectory(chain_id, account, rel_path)
+        
         try:
-            success = contract_manager.write_file(rel_path, data, offset, account)
+            success = contract_manager.write_file(relative_path, data, offset, account)
             if success:
                 # Refresh cache
                 self._refresh_cache()
