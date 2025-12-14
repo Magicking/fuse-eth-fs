@@ -57,14 +57,17 @@ class TestContractManager(unittest.TestCase):
             [0, 1],  # Before: existing slots
             [0, 1, 2]  # After: new slot 2 added
         ]
-        self.mock_contract.functions.createFile.return_value.transact.return_value = mock_tx_hash
+        self.mock_contract.functions.createDirectory.return_value.transact.return_value = mock_tx_hash
         self.mock_w3.eth.wait_for_transaction_receipt.return_value = mock_receipt
         
         result = self.manager.create_directory('mydir', '0xuser')
         
         self.assertTrue(result)
-        # Should be called with marker file path (account is passed to transact, not createFile)
-        self.mock_contract.functions.createFile.assert_called_once_with(b'mydir/.directory', b'', 0)
+        # Should be called with directory path and default target address (address(0))
+        self.mock_contract.functions.createDirectory.assert_called_once_with(
+            b'mydir', 
+            '0x0000000000000000000000000000000000000000'
+        )
     
     def test_update_file_success(self):
         """Test successful file update"""
