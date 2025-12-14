@@ -2,6 +2,7 @@
 FUSE filesystem implementation for Ethereum-backed filesystem
 """
 import os
+import errno
 import logging
 import stat
 import time
@@ -536,7 +537,7 @@ class EthFS(LoggingMixIn, Operations):
         # Check if entry exists
         entry_info = self._get_entry_info(chain_id, account, rel_path)
         if entry_info is None:
-            raise FuseOSError(os.ENOENT)
+            raise FuseOSError(errno.ENOENT)
         
         return 0
     
@@ -555,11 +556,11 @@ class EthFS(LoggingMixIn, Operations):
         chain_id, account, rel_path = self._parse_path(path)
         
         if chain_id is None or account is None or rel_path is None:
-            raise FuseOSError(os.EINVAL)
+            raise FuseOSError(errno.EINVAL)
         
         contract_manager = self._get_contract_manager(chain_id, account, rel_path)
         if contract_manager is None:
-            raise FuseOSError(os.EIO)
+            raise FuseOSError(errno.EIO)
         
         # Get relative path within subdirectory contract if needed
         relative_path = self._get_relative_path_in_subdirectory(chain_id, account, rel_path)
@@ -572,10 +573,10 @@ class EthFS(LoggingMixIn, Operations):
                 self._refresh_cache()
                 return 0
             else:
-                raise FuseOSError(os.EIO)
+                raise FuseOSError(errno.EIO)
         except Exception as e:
             logger.error(f"Error creating file {path}: {e}")
-            raise FuseOSError(os.EIO)
+            raise FuseOSError(errno.EIO)
     
     def getattr(self, path: str, fh=None) -> dict:
         """Get file attributes"""
@@ -646,7 +647,7 @@ class EthFS(LoggingMixIn, Operations):
                     'st_uid': self.default_uid,
                     'st_gid': self.default_gid,
                 }
-            raise FuseOSError(os.ENOENT)
+            raise FuseOSError(errno.ENOENT)
         
         # Determine file type
         if entry_info['type'] == ENTRY_TYPE_DIRECTORY:
@@ -682,11 +683,11 @@ class EthFS(LoggingMixIn, Operations):
         chain_id, account, rel_path = self._parse_path(path)
         
         if chain_id is None or account is None or rel_path is None:
-            raise FuseOSError(os.EINVAL)
+            raise FuseOSError(errno.EINVAL)
         
         contract_manager = self._get_contract_manager(chain_id, account, rel_path)
         if contract_manager is None:
-            raise FuseOSError(os.EIO)
+            raise FuseOSError(errno.EIO)
         
         # Get relative path within subdirectory contract if needed
         relative_path = self._get_relative_path_in_subdirectory(chain_id, account, rel_path)
@@ -699,24 +700,24 @@ class EthFS(LoggingMixIn, Operations):
                 self._refresh_cache()
                 return 0
             else:
-                raise FuseOSError(os.EIO)
+                raise FuseOSError(errno.EIO)
         except Exception as e:
             logger.error(f"Error creating directory {path}: {e}")
-            raise FuseOSError(os.EIO)
+            raise FuseOSError(errno.EIO)
     
     def open(self, path: str, flags: int) -> int:
         """Open a file"""
         chain_id, account, rel_path = self._parse_path(path)
         
         if chain_id is None or account is None or rel_path is None:
-            raise FuseOSError(os.EINVAL)
+            raise FuseOSError(errno.EINVAL)
         
         entry_info = self._get_entry_info(chain_id, account, rel_path)
         if entry_info is None:
-            raise FuseOSError(os.ENOENT)
+            raise FuseOSError(errno.ENOENT)
         
         if entry_info['type'] != ENTRY_TYPE_FILE:
-            raise FuseOSError(os.EISDIR)
+            raise FuseOSError(errno.EISDIR)
         
         # Return a file handle (we don't need to track it, just return 0)
         return 0
@@ -726,11 +727,11 @@ class EthFS(LoggingMixIn, Operations):
         chain_id, account, rel_path = self._parse_path(path)
         
         if chain_id is None or account is None or rel_path is None:
-            raise FuseOSError(os.EINVAL)
+            raise FuseOSError(errno.EINVAL)
         
         contract_manager = self._get_contract_manager(chain_id, account, rel_path)
         if contract_manager is None:
-            raise FuseOSError(os.EIO)
+            raise FuseOSError(errno.EIO)
         
         # Get relative path within subdirectory contract if needed
         relative_path = self._get_relative_path_in_subdirectory(chain_id, account, rel_path)
@@ -742,7 +743,7 @@ class EthFS(LoggingMixIn, Operations):
             return data
         except Exception as e:
             logger.error(f"Error reading file {path}: {e}")
-            raise FuseOSError(os.EIO)
+            raise FuseOSError(errno.EIO)
     
     def readdir(self, path: str, fh) -> List[str]:
         """Read directory contents"""
@@ -770,28 +771,28 @@ class EthFS(LoggingMixIn, Operations):
     
     def readlink(self, path: str) -> str:
         """Read symbolic link target"""
-        raise FuseOSError(os.EINVAL)
+        raise FuseOSError(errno.EINVAL)
     
     def rename(self, old: str, new: str) -> int:
         """Rename a file or directory"""
         # Not supported - would require updating the contract
-        raise FuseOSError(os.ENOSYS)
+        raise FuseOSError(errno.ENOSYS)
     
     def rmdir(self, path: str) -> int:
         """Remove a directory"""
         chain_id, account, rel_path = self._parse_path(path)
         
         if chain_id is None or account is None or rel_path is None:
-            raise FuseOSError(os.EINVAL)
+            raise FuseOSError(errno.EINVAL)
         
         contract_manager = self._get_contract_manager(chain_id, account, rel_path)
         if contract_manager is None:
-            raise FuseOSError(os.EIO)
+            raise FuseOSError(errno.EIO)
         
         # Check if directory is empty
         entries = self._list_directory(chain_id, account, rel_path)
         if entries:
-            raise FuseOSError(os.ENOTEMPTY)
+            raise FuseOSError(errno.ENOTEMPTY)
         
         # For directories, we delete the directory entry itself (not using relative path)
         # because the directory entry is in the parent contract
@@ -802,10 +803,10 @@ class EthFS(LoggingMixIn, Operations):
                 self._refresh_cache()
                 return 0
             else:
-                raise FuseOSError(os.EIO)
+                raise FuseOSError(errno.EIO)
         except Exception as e:
             logger.error(f"Error removing directory {path}: {e}")
-            raise FuseOSError(os.EIO)
+            raise FuseOSError(errno.EIO)
     
     def statfs(self, path: str) -> dict:
         """Get filesystem statistics"""
@@ -824,7 +825,7 @@ class EthFS(LoggingMixIn, Operations):
     
     def symlink(self, target: str, name: str) -> int:
         """Create a symbolic link"""
-        raise FuseOSError(os.ENOSYS)
+        raise FuseOSError(errno.ENOSYS)
     
     def truncate(self, path: str, length: int, fh=None) -> int:
         """Truncate a file"""
@@ -832,11 +833,11 @@ class EthFS(LoggingMixIn, Operations):
         chain_id, account, rel_path = self._parse_path(path)
         
         if chain_id is None or account is None or rel_path is None:
-            raise FuseOSError(os.EINVAL)
+            raise FuseOSError(errno.EINVAL)
         
         contract_manager = self._get_contract_manager(chain_id, account, rel_path)
         if contract_manager is None:
-            raise FuseOSError(os.EIO)
+            raise FuseOSError(errno.EIO)
         
         # Get relative path within subdirectory contract if needed
         relative_path = self._get_relative_path_in_subdirectory(chain_id, account, rel_path)
@@ -861,21 +862,21 @@ class EthFS(LoggingMixIn, Operations):
                 self._refresh_cache()
                 return 0
             else:
-                raise FuseOSError(os.EIO)
+                raise FuseOSError(errno.EIO)
         except Exception as e:
             logger.error(f"Error truncating file {path}: {e}")
-            raise FuseOSError(os.EIO)
+            raise FuseOSError(errno.EIO)
     
     def unlink(self, path: str) -> int:
         """Remove a file"""
         chain_id, account, rel_path = self._parse_path(path)
         
         if chain_id is None or account is None or rel_path is None:
-            raise FuseOSError(os.EINVAL)
+            raise FuseOSError(errno.EINVAL)
         
         contract_manager = self._get_contract_manager(chain_id, account, rel_path)
         if contract_manager is None:
-            raise FuseOSError(os.EIO)
+            raise FuseOSError(errno.EIO)
         
         # Get relative path within subdirectory contract if needed
         relative_path = self._get_relative_path_in_subdirectory(chain_id, account, rel_path)
@@ -887,10 +888,10 @@ class EthFS(LoggingMixIn, Operations):
                 self._refresh_cache()
                 return 0
             else:
-                raise FuseOSError(os.EIO)
+                raise FuseOSError(errno.EIO)
         except Exception as e:
             logger.error(f"Error removing file {path}: {e}")
-            raise FuseOSError(os.EIO)
+            raise FuseOSError(errno.EIO)
     
     def utimens(self, path: str, times=None) -> int:
         """Update file access and modification times"""
@@ -902,11 +903,11 @@ class EthFS(LoggingMixIn, Operations):
         chain_id, account, rel_path = self._parse_path(path)
         
         if chain_id is None or account is None or rel_path is None:
-            raise FuseOSError(os.EINVAL)
+            raise FuseOSError(errno.EINVAL)
         
         contract_manager = self._get_contract_manager(chain_id, account, rel_path)
         if contract_manager is None:
-            raise FuseOSError(os.EIO)
+            raise FuseOSError(errno.EIO)
         
         # Get relative path within subdirectory contract if needed
         relative_path = self._get_relative_path_in_subdirectory(chain_id, account, rel_path)
@@ -918,7 +919,7 @@ class EthFS(LoggingMixIn, Operations):
                 self._refresh_cache()
                 return len(data)
             else:
-                raise FuseOSError(os.EIO)
+                raise FuseOSError(errno.EIO)
         except Exception as e:
             logger.error(f"Error writing to file {path}: {e}")
-            raise FuseOSError(os.EIO)
+            raise FuseOSError(errno.EIO)

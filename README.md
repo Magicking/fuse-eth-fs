@@ -1,66 +1,149 @@
-## Foundry
+# Quick Start Guide
 
-**Foundry is a blazing fast, portable and modular toolkit for Ethereum application development written in Rust.**
+This guide will help you get fuse-eth-fs up and running quickly.
 
-Foundry consists of:
+## 1. Installation
 
-- **Forge**: Ethereum testing framework (like Truffle, Hardhat and DappTools).
-- **Cast**: Swiss army knife for interacting with EVM smart contracts, sending transactions and getting chain data.
-- **Anvil**: Local Ethereum node, akin to Ganache, Hardhat Network.
-- **Chisel**: Fast, utilitarian, and verbose solidity REPL.
+```bash
+# Install Python dependencies
+pip install -r requirements.txt
 
-## Documentation
-
-https://book.getfoundry.sh/
-
-## Usage
-
-### Build
-
-```shell
-$ forge build
+# Install Node.js dependencies
+npm install
 ```
 
-### Test
+## 2. Start Local Blockchain
 
-```shell
-$ forge test
+In one terminal, start a local Hardhat node:
+
+```bash
+npx hardhat node
 ```
 
-### Format
-
-```shell
-$ forge fmt
+Keep this running. You should see output like:
+```
+Started HTTP and WebSocket JSON-RPC server at http://127.0.0.1:8545/
 ```
 
-### Gas Snapshots
+## 3. Deploy Smart Contract
 
-```shell
-$ forge snapshot
+In a new terminal, deploy the FileSystem contract:
+
+```bash
+npx hardhat run scripts/deploy.js --network localhost
 ```
 
-### Anvil
-
-```shell
-$ anvil
+You should see:
+```
+FileSystem deployed to: 0x5FbDB2315678afecb367f032d93F642f64180aa3
+Deployment info saved to deployment.json
 ```
 
-### Deploy
+## 4. Configure Environment
 
-```shell
-$ forge script script/Counter.s.sol:CounterScript --rpc-url <your_rpc_url> --private-key <your_private_key>
+Copy the example environment file:
+
+```bash
+cp .env.example .env
 ```
 
-### Cast
+The default values should work with the local Hardhat node.
 
-```shell
-$ cast <subcommand>
+## 5. Create Mount Point
+
+```bash
+mkdir -p /tmp/ethfs
 ```
 
-### Help
+## 6. Mount the Filesystem
 
-```shell
-$ forge --help
-$ anvil --help
-$ cast --help
+```bash
+python -m fuse_eth_fs.main /tmp/ethfs --foreground --debug
 ```
+
+Or if you installed the package:
+
+```bash
+fuse-eth-fs /tmp/ethfs --foreground --debug
+```
+
+## 7. Use the Filesystem
+
+In another terminal:
+
+```bash
+# Navigate to the mounted filesystem
+cd /tmp/ethfs
+
+# List chain IDs
+ls -la
+# You should see: 1337 (the Hardhat local chain ID)
+
+# Navigate to your account directory
+# The default Hardhat account is 0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266
+cd 1337/0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266/
+
+# Create a file
+echo "Hello from the blockchain!" > hello.txt
+
+# Read the file
+cat hello.txt
+
+# Create a directory
+mkdir documents
+
+# Create a file in the directory
+echo "My blockchain document" > documents/readme.txt
+
+# List all files
+ls -la
+
+# Read the nested file
+cat documents/readme.txt
+
+# Delete a file
+rm hello.txt
+```
+
+## 8. View on Blockchain
+
+You can verify your files are on the blockchain by checking the contract directly:
+
+```bash
+# In a new terminal with the Hardhat console
+npx hardhat console --network localhost
+```
+
+Then in the console:
+```javascript
+const FileSystem = await ethers.getContractFactory("FileSystem");
+const fs = await FileSystem.attach("0x5FbDB2315678afecb367f032d93F642f64180aa3");
+const account = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266";
+const paths = await fs.getAccountPaths(account);
+console.log(paths);
+```
+
+## 9. Unmount
+
+To unmount the filesystem, press `Ctrl+C` in the terminal where fuse-eth-fs is running.
+
+## Troubleshooting
+
+### "fusermount: failed to open /etc/fuse.conf"
+This is usually harmless. The filesystem should still work.
+
+### "Transport Error"
+Make sure the Hardhat node is running and the RPC_URL in .env is correct.
+
+### "No contract addresses specified"
+Make sure deployment.json exists or set CONTRACT_ADDRESS in .env.
+
+### Permission errors when mounting
+Try running without `allow_other` option (default behavior).
+
+## Next Steps
+
+- Explore the code in `fuse_eth_fs/`
+- Modify the smart contract in `contracts/FileSystem.sol`
+- Connect to other networks by changing RPC_URL
+- Deploy to testnets like Sepolia or Goerli

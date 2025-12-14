@@ -182,9 +182,8 @@ class ContractManager:
             
             # Sign the transaction
             signed_tx = self.transaction_account.sign_transaction(tx)
-            
             # Send the signed transaction
-            tx_hash = self.w3.eth.send_raw_transaction(signed_tx.rawTransaction)
+            tx_hash = self.w3.eth.send_raw_transaction(signed_tx.raw_transaction)
             return tx_hash
         else:
             # Fall back to default behavior (requires node to handle signing)
