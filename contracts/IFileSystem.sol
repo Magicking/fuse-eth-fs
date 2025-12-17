@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.0;
+pragma solidity ^0.8.30;
 
 /**
  * @title IFileSystem
@@ -23,8 +23,6 @@ interface IFileSystem {
     struct Entry {
         EntryMetadata metadata;
         uint256 storageSlot; // The storage slot number for this entry
-        bytes content;  // For compatibility - reconstructed from clusters
-        address directoryTarget; // For directories: points to another IFileSystem contract
     }
     
     event FileCreated(address indexed owner, uint256 indexed storageSlot, uint256 timestamp, uint256 offset);
