@@ -8,16 +8,14 @@ This guide will help you get fuse-eth-fs up and running quickly.
 # Install Python dependencies
 pip install -r requirements.txt
 
-# Install Node.js dependencies
-npm install
 ```
 
 ## 2. Start Local Blockchain
 
-In one terminal, start a local Hardhat node:
+In one terminal, start a local anvil node:
 
 ```bash
-npx hardhat node
+anvil
 ```
 
 Keep this running. You should see output like:
@@ -30,7 +28,7 @@ Started HTTP and WebSocket JSON-RPC server at http://127.0.0.1:8545/
 In a new terminal, deploy the FileSystem contract:
 
 ```bash
-npx hardhat run scripts/deploy.js --network localhost
+forge script scripts/Deploy.s.sol --broadcast --unlocked --sender=0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266 -f http://127.0.0.1:8545
 ```
 
 You should see:
@@ -103,24 +101,6 @@ cat documents/readme.txt
 
 # Delete a file
 rm hello.txt
-```
-
-## 8. View on Blockchain
-
-You can verify your files are on the blockchain by checking the contract directly:
-
-```bash
-# In a new terminal with the Hardhat console
-npx hardhat console --network localhost
-```
-
-Then in the console:
-```javascript
-const FileSystem = await ethers.getContractFactory("FileSystem");
-const fs = await FileSystem.attach("0x5FbDB2315678afecb367f032d93F642f64180aa3");
-const account = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266";
-const paths = await fs.getAccountPaths(account);
-console.log(paths);
 ```
 
 ## 9. Unmount
