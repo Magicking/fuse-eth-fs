@@ -123,6 +123,8 @@ class EthFS(LoggingMixIn, Operations):
                             continue
                         
                         owner_lower = owner.lower()
+                        # Store slot for all accounts (world-readable)
+                        # We still track by owner for organizational purposes, but don't filter by it
                         if (chain_id, owner_lower) not in self.slot_cache:
                             self.slot_cache[(chain_id, owner_lower)] = set()
                         self.slot_cache[(chain_id, owner_lower)].add(slot)
@@ -132,7 +134,9 @@ class EthFS(LoggingMixIn, Operations):
                         if name_bytes:
                             try:
                                 full_path = name_bytes.decode('utf-8')
-                                # Store entry info with full path
+                                # Store entry info with full path for the owner
+                                # Also store it for any account that might access it (world-readable)
+                                # For now, we'll store it under the owner's key but allow access from any account
                                 self.entry_cache[(chain_id, owner_lower, full_path)] = {
                                     'slot': slot,
                                     'type': entry_type,
@@ -150,14 +154,19 @@ class EthFS(LoggingMixIn, Operations):
                 logger.error(f"Error refreshing cache for chain {chain_id}: {e}")
     
     def _get_entry_info(self, chain_id: int, account: str, path: str) -> Optional[dict]:
-        """Get entry information from cache or contract"""
+        """Get entry information from cache or contract (world-readable)"""
         account_lower = account.lower()
         
-        # Check cache first
+        # Check cache first - try account-specific cache, then check all entries
         if (chain_id, account_lower, path) in self.entry_cache:
             return self.entry_cache[(chain_id, account_lower, path)]
         
-        # Try to get from contract
+        # World-readable: check all entries in cache regardless of owner
+        for (c_id, acc, file_path), entry_info in self.entry_cache.items():
+            if c_id == chain_id and file_path == path:
+                return entry_info
+        
+        # Try to get from contract (world-readable, check all entries)
         if chain_id not in self.contract_managers:
             return None
         
@@ -168,11 +177,12 @@ class EthFS(LoggingMixIn, Operations):
         
         # Check if it's a directory by checking if any files start with this path
         # This is a fallback for directories that might not be in cache yet
+        # Check all entries regardless of owner (world-readable)
         if path and not path.endswith('/'):
             # Check if this is a directory
             dir_path = path + '/'
             for (c_id, acc, file_path) in self.entry_cache.keys():
-                if c_id == chain_id and acc == account_lower and file_path.startswith(dir_path):
+                if c_id == chain_id and file_path.startswith(dir_path):
                     return {
                         'type': ENTRY_TYPE_DIRECTORY,
                         'owner': account,
@@ -181,17 +191,17 @@ class EthFS(LoggingMixIn, Operations):
                         'name': path.split('/')[-1] if '/' in path else path
                     }
         
-        # Try to get entry from contract
+        # Try to get entry from contract (world-readable)
         # Get relative path within subdirectory contract if needed
         relative_path = self._get_relative_path_in_subdirectory(chain_id, account, path)
         
         try:
-            entry = contract_manager.get_entry(account, relative_path)
+            entry = contract_manager.get_entry(account, relative_path, any_owner=True)
             if entry:
                 entry_type, owner, name_bytes, body, timestamp, exists, file_size, dir_target = entry
                 if exists:
-                    # Find the slot
-                    slot = contract_manager._find_slot_by_path(account, relative_path)
+                    # Find the slot (any owner)
+                    slot = contract_manager._find_slot_by_path(account, relative_path, any_owner=True)
                     info = {
                         'slot': slot,
                         'type': entry_type,
@@ -202,7 +212,9 @@ class EthFS(LoggingMixIn, Operations):
                         'directory_target': dir_target if dir_target and dir_target != '0x0000000000000000000000000000000000000000' else None
                     }
                     # Cache it with the original path (not relative path)
-                    self.entry_cache[(chain_id, account_lower, path)] = info
+                    # Cache under the actual owner, but allow access from any account
+                    owner_lower = owner.lower()
+                    self.entry_cache[(chain_id, owner_lower, path)] = info
                     return info
         except Exception as e:
             logger.debug(f"Error getting entry for {path}: {e}")
@@ -405,14 +417,13 @@ class EthFS(LoggingMixIn, Operations):
                 
                 try:
                     slots = contract_manager.contract.functions.getEntries().call()
-                    account_lower = account.lower()
                     for slot in slots:
                         try:
                             entry = contract_manager.contract.functions.getEntry(slot).call()
                             entry_type, owner, name_bytes, body, timestamp, exists, file_size, dir_target = entry
                             
-                            # Filter by account owner
-                            if exists and owner.lower() == account_lower:
+                            # World-readable: show all entries regardless of owner
+                            if exists:
                                 if name_bytes:
                                     try:
                                         entry_name = name_bytes.decode('utf-8')
@@ -453,14 +464,13 @@ class EthFS(LoggingMixIn, Operations):
             
             try:
                 slots = contract_manager.contract.functions.getEntries().call()
-                account_lower = account.lower()
                 for slot in slots:
                     try:
                         entry = contract_manager.contract.functions.getEntry(slot).call()
                         entry_type, owner, name_bytes, body, timestamp, exists, file_size, dir_target = entry
                         
-                        # Filter by account owner
-                        if exists and owner.lower() == account_lower:
+                        # World-readable: show all entries regardless of owner
+                        if exists:
                             if name_bytes:
                                 try:
                                     entry_name = name_bytes.decode('utf-8')
@@ -493,7 +503,7 @@ class EthFS(LoggingMixIn, Operations):
                 logger.debug(f"Error listing directory from subdirectory contract: {e}")
                 return []
         
-        # If path is empty, list all top-level files/directories for this account
+        # If path is empty, list all top-level files/directories (world-readable)
         if not path:
             for (c_id, acc, file_path), entry_info in self.entry_cache.items():
                 if c_id == chain_id:
@@ -504,7 +514,7 @@ class EthFS(LoggingMixIn, Operations):
                     else:
                         entries.add(file_path)
         else:
-            # List files and directories in this directory
+            # List files and directories in this directory (world-readable, all owners)
             prefix = path + '/'
             for (c_id, acc, file_path), entry_info in self.entry_cache.items():
                 if c_id == chain_id and file_path.startswith(prefix):
@@ -627,11 +637,11 @@ class EthFS(LoggingMixIn, Operations):
         if entry_info is None:
             # Check if it's a directory by checking for sub-entries
             # A path is a directory if there are files that start with path + '/'
-            account_lower = account.lower()
+            # World-readable: check all entries regardless of owner
             dir_path = rel_path + '/' if rel_path else ''
             is_directory = False
             for (c_id, acc, file_path) in self.entry_cache.keys():
-                if c_id == chain_id and acc == account_lower:
+                if c_id == chain_id:
                     if file_path.startswith(dir_path) and file_path != rel_path:
                         is_directory = True
                         break

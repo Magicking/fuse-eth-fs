@@ -214,10 +214,15 @@ class ContractManager:
         """Get path from storage slot"""
         return self.slot_to_path.get((account.lower(), slot))
     
-    def _find_slot_by_path(self, account: str, path: str) -> Optional[int]:
+    def _find_slot_by_path(self, account: str, path: str, any_owner: bool = False) -> Optional[int]:
         """
         Find storage slot for a path by querying all entries and matching by name
         This is used when we don't have a local mapping
+        
+        Args:
+            account: Account to search for (ignored if any_owner=True)
+            path: Path to find
+            any_owner: If True, find the file regardless of owner (for read operations)
         """
         try:
             slots = self.contract.functions.getEntries().call()
@@ -228,7 +233,7 @@ class ContractManager:
                     entry = self.contract.functions.getEntry(slot).call()
                     entry_type, owner, name_bytes, body, timestamp, exists, file_size, dir_target = entry
                     
-                    if exists and owner.lower() == account.lower():
+                    if exists and (any_owner or owner.lower() == account.lower()):
                         if (entry_type == 0 or entry_type == 1) and name_bytes == path_bytes:  # FILE or DIRECTORY type
                             # Update our mapping
                             key = (account.lower(), path)
@@ -372,13 +377,13 @@ class ContractManager:
             logger.error(f"Error deleting entry '{path}' for account {account}: {e}")
             return False
     
-    def get_entry(self, account: str, path: str) -> Optional[Tuple]:
+    def get_entry(self, account: str, path: str, any_owner: bool = False) -> Optional[Tuple]:
         """
-        Get entry information
+        Get entry information (world-readable if any_owner=True)
         Returns: (entryType, owner, name, body, timestamp, entryExists, fileSize, directoryTarget)
         """
         try:
-            storage_slot = self._find_slot_by_path(account, path)
+            storage_slot = self._find_slot_by_path(account, path, any_owner=any_owner)
             if storage_slot is None:
                 return None
             result = self.contract.functions.getEntry(storage_slot).call()
@@ -455,9 +460,9 @@ class ContractManager:
             return False
     
     def read_file(self, path: str, offset: int, length: int, account: str) -> Optional[bytes]:
-        """Read file body at a specific offset"""
+        """Read file body at a specific offset (world-readable, no owner check)"""
         try:
-            storage_slot = self._find_slot_by_path(account, path)
+            storage_slot = self._find_slot_by_path(account, path, any_owner=True)
             if storage_slot is None:
                 return None
             result = self.contract.functions.readFile(storage_slot, offset, length).call()
