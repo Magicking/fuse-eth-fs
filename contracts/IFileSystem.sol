@@ -86,10 +86,62 @@ interface IFileSystem {
         );
     
     /**
+     * @dev Get entry information at a specific storage slot with pagination support for body content
+     * @param storageSlot The storage slot number
+     * @param startingOffset The byte offset to start reading the body content from
+     * @param maximumLength The maximum number of bytes to read from body (0 means read to end)
+     * @return entryType The type of the entry (FILE or DIRECTORY)
+     * @return owner The owner of the entry
+     * @return name The name of the file (empty for directories)
+     * @return body The body/content (for files, from startingOffset up to maximumLength bytes)
+     * @return timestamp The last modification timestamp
+     * @return entryExists Whether the entry exists
+     * @return fileSize The size of the file in bytes
+     * @return directoryTarget For directories: the IFileSystem contract address this directory points to
+     */
+    function getEntry(uint256 storageSlot, uint256 startingOffset, uint256 maximumLength) 
+        external 
+        view 
+        returns (
+            EntryType entryType,
+            address owner,
+            bytes memory name,
+            bytes memory body,
+            uint256 timestamp,
+            bool entryExists,
+            uint256 fileSize,
+            address directoryTarget
+        );
+    
+    /**
      * @dev Get all storage slots that have entries in this filesystem
      * @return An array of all storage slot numbers with entries
      */
     function getEntries() external view returns (uint256[] memory);
+    
+    /**
+     * @dev Get storage slots with pagination support
+     * @param startingOffset The index to start from in the entries array
+     * @param maximumLength The maximum number of entries to return (0 means all remaining)
+     * @return An array of storage slot numbers
+     */
+    function getEntries(uint256 startingOffset, uint256 maximumLength) 
+        external 
+        view 
+        returns (uint256[] memory);
+    
+    /**
+     * @dev Get the total count of entries in this filesystem
+     * @return The number of entries
+     */
+    function getEntryCount() external view returns (uint256);
+    
+    /**
+     * @dev Get the size of a file at a specific storage slot
+     * @param storageSlot The storage slot number
+     * @return fileSize The size of the file in bytes (0 for directories or non-existent entries)
+     */
+    function getFileSize(uint256 storageSlot) external view returns (uint256 fileSize);
     
     /**
      * @dev Check if an entry exists at a specific storage slot

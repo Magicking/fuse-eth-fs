@@ -10,6 +10,10 @@ from eth_account import Account
 
 logger = logging.getLogger(__name__)
 
+# Contract function signatures for accessing overloaded functions
+FUNC_GET_ENTRY_PAGINATED = 'getEntry(uint256,uint256,uint256)'
+FUNC_GET_ENTRIES_PAGINATED = 'getEntries(uint256,uint256)'
+
 
 class ContractManager:
     """Manages interactions with the FileSystem smart contract"""
@@ -99,9 +103,53 @@ class ContractManager:
                     "type": "function"
                 },
                 {
+                    "inputs": [
+                        {"name": "storageSlot", "type": "uint256"},
+                        {"name": "startingOffset", "type": "uint256"},
+                        {"name": "maximumLength", "type": "uint256"}
+                    ],
+                    "name": "getEntry",
+                    "outputs": [
+                        {"name": "entryType", "type": "uint8"},
+                        {"name": "owner", "type": "address"},
+                        {"name": "name", "type": "bytes"},
+                        {"name": "body", "type": "bytes"},
+                        {"name": "timestamp", "type": "uint256"},
+                        {"name": "entryExists", "type": "bool"},
+                        {"name": "fileSize", "type": "uint256"},
+                        {"name": "directoryTarget", "type": "address"}
+                    ],
+                    "stateMutability": "view",
+                    "type": "function"
+                },
+                {
                     "inputs": [],
                     "name": "getEntries",
                     "outputs": [{"name": "", "type": "uint256[]"}],
+                    "stateMutability": "view",
+                    "type": "function"
+                },
+                {
+                    "inputs": [
+                        {"name": "startingOffset", "type": "uint256"},
+                        {"name": "maximumLength", "type": "uint256"}
+                    ],
+                    "name": "getEntries",
+                    "outputs": [{"name": "", "type": "uint256[]"}],
+                    "stateMutability": "view",
+                    "type": "function"
+                },
+                {
+                    "inputs": [],
+                    "name": "getEntryCount",
+                    "outputs": [{"name": "", "type": "uint256"}],
+                    "stateMutability": "view",
+                    "type": "function"
+                },
+                {
+                    "inputs": [{"name": "storageSlot", "type": "uint256"}],
+                    "name": "getFileSize",
+                    "outputs": [{"name": "fileSize", "type": "uint256"}],
                     "stateMutability": "view",
                     "type": "function"
                 },
@@ -470,3 +518,75 @@ class ContractManager:
         except Exception as e:
             logger.error(f"Error reading file '{path}' for account {account}: {e}")
             return None
+    
+    def get_entry_paginated(self, account: str, path: str, starting_offset: int, maximum_length: int, any_owner: bool = False) -> Optional[Tuple]:
+        """
+        Get entry information with pagination support for body content (world-readable if any_owner=True)
+        
+        Args:
+            account: Account to search for (ignored if any_owner=True)
+            path: Path to the entry
+            starting_offset: Byte offset to start reading body content from
+            maximum_length: Maximum number of bytes to read from body (0 means read to end)
+            any_owner: If True, find the file regardless of owner
+            
+        Returns: (entryType, owner, name, body, timestamp, entryExists, fileSize, directoryTarget)
+        """
+        try:
+            storage_slot = self._find_slot_by_path(account, path, any_owner=any_owner)
+            if storage_slot is None:
+                return None
+            result = self.contract.functions[FUNC_GET_ENTRY_PAGINATED](storage_slot, starting_offset, maximum_length).call()
+            return result
+        except Exception as e:
+            logger.debug(f"Error getting paginated entry '{path}' for account {account}: {e}")
+            return None
+    
+    def get_entries_paginated(self, starting_offset: int, maximum_length: int) -> List[int]:
+        """
+        Get storage slots with pagination support
+        
+        Args:
+            starting_offset: The index to start from in the entries array
+            maximum_length: The maximum number of entries to return (0 means all remaining)
+            
+        Returns: List of storage slot numbers
+        """
+        try:
+            result = self.contract.functions[FUNC_GET_ENTRIES_PAGINATED](starting_offset, maximum_length).call()
+            return list(result)
+        except Exception as e:
+            logger.error(f"Error getting paginated entries: {e}")
+            return []
+    
+    def get_entry_count(self) -> int:
+        """
+        Get the total count of entries in this filesystem
+        
+        Returns: The number of entries
+        """
+        try:
+            return self.contract.functions.getEntryCount().call()
+        except Exception as e:
+            logger.error(f"Error getting entry count: {e}")
+            return 0
+    
+    def get_file_size(self, account: str, path: str, any_owner: bool = False) -> int:
+        """
+        Get the size of a file at a specific storage slot
+        
+        Args:
+            account: Account to search for (ignored if any_owner=True)
+            path: Path to the file
+            any_owner: If True, find the file regardless of owner
+            
+        Returns: File size in bytes (0 for directories or non-existent entries)
+        """
+        try:
+            storage_slot = self._find_slot_by_path(account, path, any_owner=any_owner)
+            if storage_slot is None:
+                return 0
+            return self.contract.functions.getFileSize(storage_slot).call()
+        except Exception as e:
+            logger.debug(f"Error getting file size for '{path}': {e}")
+            return 0
