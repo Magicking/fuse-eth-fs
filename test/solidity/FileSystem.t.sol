@@ -543,4 +543,191 @@ contract FileSystemTest is Test {
             }
         }
     }
+    
+    // Tests for pagination functionality
+    
+    function testGetEntryWithPagination() public {
+        vm.startPrank(user1);
+        // Create a file with content larger than typical read size
+        bytes memory content = bytes("Hello, World! This is a test file with some content for pagination testing.");
+        fs.createFile(bytes("test.txt"), content, 0);
+        uint256[] memory entries = fs.getEntries();
+        slotFile1 = entries[0];
+        
+        // Test reading from offset 0 with limited length
+        (, , , bytes memory body1, , , , ) = fs.getEntry(slotFile1, 0, 13);
+        assertEq(string(body1), "Hello, World!");
+        
+        // Test reading from offset 7 with limited length
+        (, , , bytes memory body2, , , , ) = fs.getEntry(slotFile1, 7, 5);
+        assertEq(string(body2), "World");
+        
+        // Test reading with 0 length (should read to end)
+        (, , , bytes memory body3, , , , ) = fs.getEntry(slotFile1, 14, 0);
+        assertEq(string(body3), string(abi.encodePacked(bytes(content)[14:])));
+        
+        // Test reading beyond file size
+        (, , , bytes memory body4, , , , ) = fs.getEntry(slotFile1, 1000, 10);
+        assertEq(body4.length, 0);
+        
+        vm.stopPrank();
+    }
+    
+    function testGetEntriesWithPagination() public {
+        vm.startPrank(user1);
+        // Create multiple files
+        fs.createFile(bytes("file1.txt"), bytes("File 1"), 0);
+        fs.createFile(bytes("file2.txt"), bytes("File 2"), 0);
+        fs.createFile(bytes("file3.txt"), bytes("File 3"), 0);
+        fs.createFile(bytes("file4.txt"), bytes("File 4"), 0);
+        fs.createFile(bytes("file5.txt"), bytes("File 5"), 0);
+        
+        uint256[] memory allEntries = fs.getEntries();
+        assertEq(allEntries.length, 5);
+        
+        // Test getting first 2 entries
+        uint256[] memory page1 = fs.getEntries(0, 2);
+        assertEq(page1.length, 2);
+        assertEq(page1[0], allEntries[0]);
+        assertEq(page1[1], allEntries[1]);
+        
+        // Test getting next 2 entries
+        uint256[] memory page2 = fs.getEntries(2, 2);
+        assertEq(page2.length, 2);
+        assertEq(page2[0], allEntries[2]);
+        assertEq(page2[1], allEntries[3]);
+        
+        // Test getting last entry
+        uint256[] memory page3 = fs.getEntries(4, 2);
+        assertEq(page3.length, 1);
+        assertEq(page3[0], allEntries[4]);
+        
+        // Test getting all with 0 length (should return all remaining)
+        uint256[] memory pageAll = fs.getEntries(0, 0);
+        assertEq(pageAll.length, 5);
+        
+        // Test offset beyond length
+        uint256[] memory pageEmpty = fs.getEntries(10, 2);
+        assertEq(pageEmpty.length, 0);
+        
+        vm.stopPrank();
+    }
+    
+    function testGetEntryCount() public {
+        vm.startPrank(user1);
+        
+        assertEq(fs.getEntryCount(), 0);
+        
+        fs.createFile(bytes("file1.txt"), bytes("1"), 0);
+        assertEq(fs.getEntryCount(), 1);
+        
+        fs.createFile(bytes("file2.txt"), bytes("2"), 0);
+        assertEq(fs.getEntryCount(), 2);
+        
+        fs.createDirectory(bytes("dir1"), address(fs2));
+        assertEq(fs.getEntryCount(), 3);
+        
+        // Delete an entry
+        uint256[] memory entries = fs.getEntries();
+        fs.deleteEntry(entries[0]);
+        assertEq(fs.getEntryCount(), 2);
+        
+        vm.stopPrank();
+    }
+    
+    function testGetFileSize() public {
+        vm.startPrank(user1);
+        
+        fs.createFile(bytes("test.txt"), bytes("Hello, World!"), 0);
+        uint256[] memory entries = fs.getEntries();
+        slotFile1 = entries[0];
+        
+        uint256 size = fs.getFileSize(slotFile1);
+        assertEq(size, 13);
+        
+        // Test with directory (should return 0)
+        fs.createDirectory(bytes("testdir"), address(fs2));
+        uint256[] memory entries2 = fs.getEntries();
+        slotDir1 = entries2[1];
+        
+        uint256 dirSize = fs.getFileSize(slotDir1);
+        assertEq(dirSize, 0);
+        
+        // Test with non-existent entry (should return 0)
+        uint256 nonExistentSize = fs.getFileSize(999);
+        assertEq(nonExistentSize, 0);
+        
+        vm.stopPrank();
+    }
+    
+    function testPaginationBoundaryConditions() public {
+        vm.startPrank(user1);
+        
+        // Create a file with exactly 32 bytes (one cluster)
+        bytes memory content32 = bytes("12345678901234567890123456789012"); // 32 bytes
+        fs.createFile(bytes("32byte.txt"), content32, 0);
+        uint256[] memory entries = fs.getEntries();
+        slotFile1 = entries[0];
+        
+        // Read exactly one cluster
+        (, , , bytes memory body1, , , , ) = fs.getEntry(slotFile1, 0, 32);
+        assertEq(body1.length, 32);
+        assertEq(string(body1), string(content32));
+        
+        // Read spanning cluster boundary
+        bytes memory content64 = bytes("1234567890123456789012345678901212345678901234567890123456789012"); // 64 bytes
+        fs.createFile(bytes("64byte.txt"), content64, 0);
+        uint256[] memory entries2 = fs.getEntries();
+        slotFile2 = entries2[1];
+        
+        // Read from middle of first cluster to middle of second cluster
+        (, , , bytes memory body2, , , , ) = fs.getEntry(slotFile2, 16, 32);
+        assertEq(body2.length, 32);
+        
+        vm.stopPrank();
+    }
+    
+    function testPaginationWithOffset() public {
+        vm.startPrank(user1);
+        
+        // Create file with offset
+        fs.createFile(bytes("offset.txt"), bytes("World"), 6);
+        uint256[] memory entries = fs.getEntries();
+        slotFile1 = entries[0];
+        
+        // Read the entire file including padding
+        (, , , bytes memory body1, , , uint256 size1, ) = fs.getEntry(slotFile1, 0, 0);
+        assertEq(size1, 11); // 6 bytes padding + 5 bytes "World"
+        
+        // Read just the content part
+        (, , , bytes memory body2, , , , ) = fs.getEntry(slotFile1, 6, 5);
+        assertEq(string(body2), "World");
+        
+        // Read just the padding
+        (, , , bytes memory body3, , , , ) = fs.getEntry(slotFile1, 0, 6);
+        assertEq(body3.length, 6);
+        
+        vm.stopPrank();
+    }
+    
+    function testMaximumLengthExceedingFileSize() public {
+        vm.startPrank(user1);
+        
+        fs.createFile(bytes("small.txt"), bytes("Small"), 0);
+        uint256[] memory entries = fs.getEntries();
+        slotFile1 = entries[0];
+        
+        // Request more bytes than available
+        (, , , bytes memory body, , , uint256 size, ) = fs.getEntry(slotFile1, 0, 1000);
+        assertEq(body.length, 5); // Should only return available bytes
+        assertEq(size, 5);
+        assertEq(string(body), "Small");
+        
+        // Request from offset with large length
+        (, , , bytes memory body2, , , , ) = fs.getEntry(slotFile1, 2, 1000);
+        assertEq(body2.length, 3); // Should only return remaining bytes
+        assertEq(string(body2), "all");
+        
+        vm.stopPrank();
+    }
 }
