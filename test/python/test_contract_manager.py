@@ -3,7 +3,7 @@ Unit tests for ContractManager
 """
 import unittest
 from unittest.mock import Mock, patch, MagicMock, call
-from fuse_eth_fs.contract_manager import ContractManager
+from fuse_eth_fs.contract_manager import ContractManager, FUNC_GET_ENTRY_PAGINATED, FUNC_GET_ENTRIES_PAGINATED
 
 
 class TestContractManager(unittest.TestCase):
@@ -233,7 +233,7 @@ class TestContractManager(unittest.TestCase):
         self.assertEqual(result[3], b'Hello')  # body at index 3
         
         # Verify the correct function was called
-        self.mock_contract.functions.__getitem__.assert_called_with('getEntry(uint256,uint256,uint256)')
+        self.mock_contract.functions.__getitem__.assert_called_with(FUNC_GET_ENTRY_PAGINATED)
     
     def test_get_entries_paginated_success(self):
         """Test getting entries with pagination"""
@@ -245,7 +245,7 @@ class TestContractManager(unittest.TestCase):
         result = self.manager.get_entries_paginated(2, 3)
         
         self.assertEqual(result, [3, 4, 5])
-        self.mock_contract.functions.__getitem__.assert_called_with('getEntries(uint256,uint256)')
+        self.mock_contract.functions.__getitem__.assert_called_with(FUNC_GET_ENTRIES_PAGINATED)
     
     def test_get_entries_paginated_failure(self):
         """Test getting entries with pagination when contract call fails"""

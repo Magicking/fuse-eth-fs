@@ -12,7 +12,7 @@ from web3 import Web3
 from eth_account import Account
 
 from .rpc_manager import RPCManager
-from .contract_manager import ContractManager
+from .contract_manager import ContractManager, FUNC_GET_ENTRY_PAGINATED
 
 logger = logging.getLogger(__name__)
 
@@ -20,6 +20,12 @@ logger = logging.getLogger(__name__)
 ENTRY_TYPE_FILE = 0
 ENTRY_TYPE_DIRECTORY = 1
 ENTRY_TYPE_LINK = 2
+
+# Pagination constants
+CACHE_REFRESH_BATCH_SIZE = 100  # Number of entries to fetch per batch when refreshing cache
+DIRECTORY_LIST_BATCH_SIZE = 50  # Number of entries to fetch per batch when listing directories
+NO_BODY_OFFSET = 0  # Offset parameter to skip loading body content
+NO_BODY_LENGTH = 0  # Length parameter to skip loading body content
 
 
 class EthFS(LoggingMixIn, Operations):
@@ -115,7 +121,7 @@ class EthFS(LoggingMixIn, Operations):
                 entry_count = contract_manager.get_entry_count()
                 
                 # Pagination parameters - fetch in batches to avoid large responses
-                batch_size = 100  # Process 100 entries at a time
+                batch_size = CACHE_REFRESH_BATCH_SIZE
                 offset = 0
                 
                 while offset < entry_count:
@@ -129,7 +135,7 @@ class EthFS(LoggingMixIn, Operations):
                         try:
                             # Get entry without body content (use pagination with 0 length to get metadata only)
                             # We'll load body on-demand when files are actually read
-                            entry = contract_manager.contract.functions['getEntry(uint256,uint256,uint256)'](slot, 0, 0).call()
+                            entry = contract_manager.contract.functions[FUNC_GET_ENTRY_PAGINATED](slot, NO_BODY_OFFSET, NO_BODY_LENGTH).call()
                             entry_type, owner, name_bytes, body, timestamp, exists, file_size, dir_target = entry
                             
                             if not exists:
@@ -437,7 +443,7 @@ class EthFS(LoggingMixIn, Operations):
                 try:
                     # Use pagination to list entries efficiently
                     entry_count = contract_manager.get_entry_count()
-                    batch_size = 50  # Process entries in batches
+                    batch_size = DIRECTORY_LIST_BATCH_SIZE
                     offset = 0
                     
                     while offset < entry_count:
@@ -448,7 +454,7 @@ class EthFS(LoggingMixIn, Operations):
                         for slot in slots:
                             try:
                                 # Get entry without body to reduce data transfer
-                                entry = contract_manager.contract.functions['getEntry(uint256,uint256,uint256)'](slot, 0, 0).call()
+                                entry = contract_manager.contract.functions[FUNC_GET_ENTRY_PAGINATED](slot, NO_BODY_OFFSET, NO_BODY_LENGTH).call()
                                 entry_type, owner, name_bytes, body, timestamp, exists, file_size, dir_target = entry
                                 
                                 # World-readable: show all entries regardless of owner
@@ -499,7 +505,7 @@ class EthFS(LoggingMixIn, Operations):
             try:
                 # Use pagination to list entries efficiently
                 entry_count = contract_manager.get_entry_count()
-                batch_size = 50  # Process entries in batches
+                batch_size = DIRECTORY_LIST_BATCH_SIZE
                 offset = 0
                 
                 while offset < entry_count:
@@ -510,7 +516,7 @@ class EthFS(LoggingMixIn, Operations):
                     for slot in slots:
                         try:
                             # Get entry without body to reduce data transfer
-                            entry = contract_manager.contract.functions['getEntry(uint256,uint256,uint256)'](slot, 0, 0).call()
+                            entry = contract_manager.contract.functions[FUNC_GET_ENTRY_PAGINATED](slot, NO_BODY_OFFSET, NO_BODY_LENGTH).call()
                             entry_type, owner, name_bytes, body, timestamp, exists, file_size, dir_target = entry
                             
                             # World-readable: show all entries regardless of owner

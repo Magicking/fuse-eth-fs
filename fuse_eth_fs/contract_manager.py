@@ -10,6 +10,10 @@ from eth_account import Account
 
 logger = logging.getLogger(__name__)
 
+# Contract function signatures for accessing overloaded functions
+FUNC_GET_ENTRY_PAGINATED = 'getEntry(uint256,uint256,uint256)'
+FUNC_GET_ENTRIES_PAGINATED = 'getEntries(uint256,uint256)'
+
 
 class ContractManager:
     """Manages interactions with the FileSystem smart contract"""
@@ -532,7 +536,7 @@ class ContractManager:
             storage_slot = self._find_slot_by_path(account, path, any_owner=any_owner)
             if storage_slot is None:
                 return None
-            result = self.contract.functions['getEntry(uint256,uint256,uint256)'](storage_slot, starting_offset, maximum_length).call()
+            result = self.contract.functions[FUNC_GET_ENTRY_PAGINATED](storage_slot, starting_offset, maximum_length).call()
             return result
         except Exception as e:
             logger.debug(f"Error getting paginated entry '{path}' for account {account}: {e}")
@@ -549,7 +553,7 @@ class ContractManager:
         Returns: List of storage slot numbers
         """
         try:
-            result = self.contract.functions['getEntries(uint256,uint256)'](starting_offset, maximum_length).call()
+            result = self.contract.functions[FUNC_GET_ENTRIES_PAGINATED](starting_offset, maximum_length).call()
             return list(result)
         except Exception as e:
             logger.error(f"Error getting paginated entries: {e}")
