@@ -105,51 +105,70 @@ class EthFS(LoggingMixIn, Operations):
         return (chain_id, account, relative_path)
     
     def _refresh_cache(self):
-        """Refresh the cache by querying all entries from contracts"""
+        """Refresh the cache by querying all entries from contracts using pagination"""
         self.entry_cache.clear()
         self.slot_cache.clear()
         
         for chain_id, contract_manager in self.contract_managers.items():
             try:
-                # Get all storage slots
-                slots = contract_manager.contract.functions.getEntries().call()
+                # Get entry count for pagination
+                entry_count = contract_manager.get_entry_count()
                 
-                for slot in slots:
-                    try:
-                        entry = contract_manager.contract.functions.getEntry(slot).call()
-                        entry_type, owner, name_bytes, body, timestamp, exists, file_size, dir_target = entry
-                        
-                        if not exists:
-                            continue
-                        
-                        owner_lower = owner.lower()
-                        # Store slot for all accounts (world-readable)
-                        # We still track by owner for organizational purposes, but don't filter by it
-                        if (chain_id, owner_lower) not in self.slot_cache:
-                            self.slot_cache[(chain_id, owner_lower)] = set()
-                        self.slot_cache[(chain_id, owner_lower)].add(slot)
-                        
-                        # Build path from entry name (which stores the full path)
-                        # Both files and directories now store their names
-                        if name_bytes:
-                            try:
-                                full_path = name_bytes.decode('utf-8')
-                                # Store entry info with full path for the owner
-                                # Also store it for any account that might access it (world-readable)
-                                # For now, we'll store it under the owner's key but allow access from any account
-                                self.entry_cache[(chain_id, owner_lower, full_path)] = {
-                                    'slot': slot,
-                                    'type': entry_type,
-                                    'owner': owner,
-                                    'size': file_size,
-                                    'timestamp': timestamp,
-                                    'name': full_path.split('/')[-1] if '/' in full_path else full_path,
-                                    'directory_target': dir_target if dir_target and dir_target != '0x0000000000000000000000000000000000000000' else None
-                                }
-                            except UnicodeDecodeError:
-                                logger.warning(f"Could not decode name for slot {slot}")
-                    except Exception as e:
-                        logger.debug(f"Error processing slot {slot} on chain {chain_id}: {e}")
+                # Pagination parameters - fetch in batches to avoid large responses
+                batch_size = 100  # Process 100 entries at a time
+                offset = 0
+                
+                while offset < entry_count:
+                    # Get paginated batch of slots
+                    slots = contract_manager.get_entries_paginated(offset, batch_size)
+                    
+                    if not slots:
+                        break
+                    
+                    for slot in slots:
+                        try:
+                            # Get entry without body content (use pagination with 0 length to get metadata only)
+                            # We'll load body on-demand when files are actually read
+                            entry = contract_manager.contract.functions['getEntry(uint256,uint256,uint256)'](slot, 0, 0).call()
+                            entry_type, owner, name_bytes, body, timestamp, exists, file_size, dir_target = entry
+                            
+                            if not exists:
+                                continue
+                            
+                            owner_lower = owner.lower()
+                            # Store slot for all accounts (world-readable)
+                            # We still track by owner for organizational purposes, but don't filter by it
+                            if (chain_id, owner_lower) not in self.slot_cache:
+                                self.slot_cache[(chain_id, owner_lower)] = set()
+                            self.slot_cache[(chain_id, owner_lower)].add(slot)
+                            
+                            # Build path from entry name (which stores the full path)
+                            # Both files and directories now store their names
+                            if name_bytes:
+                                try:
+                                    full_path = name_bytes.decode('utf-8')
+                                    # Store entry info with full path for the owner
+                                    # Also store it for any account that might access it (world-readable)
+                                    # For now, we'll store it under the owner's key but allow access from any account
+                                    self.entry_cache[(chain_id, owner_lower, full_path)] = {
+                                        'slot': slot,
+                                        'type': entry_type,
+                                        'owner': owner,
+                                        'size': file_size,
+                                        'timestamp': timestamp,
+                                        'name': full_path.split('/')[-1] if '/' in full_path else full_path,
+                                        'directory_target': dir_target if dir_target and dir_target != '0x0000000000000000000000000000000000000000' else None
+                                    }
+                                except UnicodeDecodeError:
+                                    logger.warning(f"Could not decode name for slot {slot}")
+                        except Exception as e:
+                            logger.debug(f"Error processing slot {slot} on chain {chain_id}: {e}")
+                    
+                    offset += len(slots)
+                    
+                    # Break if we got fewer slots than requested (end of list)
+                    if len(slots) < batch_size:
+                        break
             except Exception as e:
                 logger.error(f"Error refreshing cache for chain {chain_id}: {e}")
     
@@ -416,30 +435,45 @@ class EthFS(LoggingMixIn, Operations):
                     return []
                 
                 try:
-                    slots = contract_manager.contract.functions.getEntries().call()
-                    for slot in slots:
-                        try:
-                            entry = contract_manager.contract.functions.getEntry(slot).call()
-                            entry_type, owner, name_bytes, body, timestamp, exists, file_size, dir_target = entry
-                            
-                            # World-readable: show all entries regardless of owner
-                            if exists:
-                                if name_bytes:
-                                    try:
-                                        entry_name = name_bytes.decode('utf-8')
-                                        # In subdirectory contracts, entries are stored with relative paths
-                                        # When listing the root of a subdirectory contract, show all top-level entries
-                                        if '/' in entry_name:
-                                            # Entry is in a subdirectory, get the first component
-                                            first_part = entry_name.split('/')[0]
-                                            entries.add(first_part)
-                                        else:
-                                            # Entry is at root level
-                                            entries.add(entry_name)
-                                    except UnicodeDecodeError:
-                                        pass
-                        except Exception:
-                            continue
+                    # Use pagination to list entries efficiently
+                    entry_count = contract_manager.get_entry_count()
+                    batch_size = 50  # Process entries in batches
+                    offset = 0
+                    
+                    while offset < entry_count:
+                        slots = contract_manager.get_entries_paginated(offset, batch_size)
+                        if not slots:
+                            break
+                        
+                        for slot in slots:
+                            try:
+                                # Get entry without body to reduce data transfer
+                                entry = contract_manager.contract.functions['getEntry(uint256,uint256,uint256)'](slot, 0, 0).call()
+                                entry_type, owner, name_bytes, body, timestamp, exists, file_size, dir_target = entry
+                                
+                                # World-readable: show all entries regardless of owner
+                                if exists:
+                                    if name_bytes:
+                                        try:
+                                            entry_name = name_bytes.decode('utf-8')
+                                            # In subdirectory contracts, entries are stored with relative paths
+                                            # When listing the root of a subdirectory contract, show all top-level entries
+                                            if '/' in entry_name:
+                                                # Entry is in a subdirectory, get the first component
+                                                first_part = entry_name.split('/')[0]
+                                                entries.add(first_part)
+                                            else:
+                                                # Entry is at root level
+                                                entries.add(entry_name)
+                                        except UnicodeDecodeError:
+                                            pass
+                            except Exception:
+                                continue
+                        
+                        offset += len(slots)
+                        if len(slots) < batch_size:
+                            break
+                    
                     return sorted(list(entries))
                 except Exception as e:
                     logger.debug(f"Error listing directory from subdirectory contract: {e}")
@@ -463,41 +497,56 @@ class EthFS(LoggingMixIn, Operations):
             relative_path = self._get_relative_path_in_subdirectory(chain_id, account, path)
             
             try:
-                slots = contract_manager.contract.functions.getEntries().call()
-                for slot in slots:
-                    try:
-                        entry = contract_manager.contract.functions.getEntry(slot).call()
-                        entry_type, owner, name_bytes, body, timestamp, exists, file_size, dir_target = entry
-                        
-                        # World-readable: show all entries regardless of owner
-                        if exists:
-                            if name_bytes:
-                                try:
-                                    entry_name = name_bytes.decode('utf-8')
-                                    # In subdirectory contracts, entries are stored with relative paths
-                                    # If relative_path is empty (listing root of subdirectory contract), show all top-level entries
-                                    if not relative_path:
-                                        # Get the first component of the path
-                                        if '/' in entry_name:
-                                            first_part = entry_name.split('/')[0]
-                                            entries.add(first_part)
+                # Use pagination to list entries efficiently
+                entry_count = contract_manager.get_entry_count()
+                batch_size = 50  # Process entries in batches
+                offset = 0
+                
+                while offset < entry_count:
+                    slots = contract_manager.get_entries_paginated(offset, batch_size)
+                    if not slots:
+                        break
+                    
+                    for slot in slots:
+                        try:
+                            # Get entry without body to reduce data transfer
+                            entry = contract_manager.contract.functions['getEntry(uint256,uint256,uint256)'](slot, 0, 0).call()
+                            entry_type, owner, name_bytes, body, timestamp, exists, file_size, dir_target = entry
+                            
+                            # World-readable: show all entries regardless of owner
+                            if exists:
+                                if name_bytes:
+                                    try:
+                                        entry_name = name_bytes.decode('utf-8')
+                                        # In subdirectory contracts, entries are stored with relative paths
+                                        # If relative_path is empty (listing root of subdirectory contract), show all top-level entries
+                                        if not relative_path:
+                                            # Get the first component of the path
+                                            if '/' in entry_name:
+                                                first_part = entry_name.split('/')[0]
+                                                entries.add(first_part)
+                                            else:
+                                                entries.add(entry_name)
                                         else:
-                                            entries.add(entry_name)
-                                    else:
-                                        # We're listing a subdirectory within the subdirectory contract
-                                        # Check if entry is in this subdirectory
-                                        if entry_name.startswith(relative_path + '/'):
-                                            remaining = entry_name[len(relative_path + '/'):]
-                                            if remaining:
-                                                next_part = remaining.split('/')[0]
-                                                entries.add(next_part)
-                                        elif entry_name == relative_path:
-                                            # This is the directory itself, skip it
-                                            pass
-                                except UnicodeDecodeError:
-                                    pass
-                    except Exception:
-                        continue
+                                            # We're listing a subdirectory within the subdirectory contract
+                                            # Check if entry is in this subdirectory
+                                            if entry_name.startswith(relative_path + '/'):
+                                                remaining = entry_name[len(relative_path + '/'):]
+                                                if remaining:
+                                                    next_part = remaining.split('/')[0]
+                                                    entries.add(next_part)
+                                            elif entry_name == relative_path:
+                                                # This is the directory itself, skip it
+                                                pass
+                                    except UnicodeDecodeError:
+                                        pass
+                        except Exception:
+                            continue
+                    
+                    offset += len(slots)
+                    if len(slots) < batch_size:
+                        break
+                
                 return sorted(list(entries))
             except Exception as e:
                 logger.debug(f"Error listing directory from subdirectory contract: {e}")
