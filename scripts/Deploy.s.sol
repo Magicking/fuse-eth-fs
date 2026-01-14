@@ -4,7 +4,7 @@ pragma solidity ^0.8.0;
 import {Script, console} from "forge-std/Script.sol";
 import {FileSystem} from "../contracts/FileSystem.sol";
 import {IFileSystem} from "../contracts/IFileSystem.sol";
-import {GraffitiPlugin} from "../contracts/plugins/erc721/Graffiti.sol";
+import {GraffitiPlugin} from "../contracts/plugins/graffiti/Graffiti.sol";
 import {stdJson} from "forge-std/StdJson.sol";
 
 contract Deploy is Script {
@@ -21,7 +21,7 @@ contract Deploy is Script {
         fileSystem.createFile(bytes("config.txt"), bytes("debug=true\nport=8080\n"), 0);
         
         // Create a graffiti plugin
-        GraffitiPlugin graffitiPlugin = new GraffitiPlugin(address(0xCc39Fe145eECe8a733833D7A78dCa7f287996693));
+        GraffitiPlugin graffitiPlugin = new GraffitiPlugin();
         fileSystem.createDirectory(bytes("graffiti"), address(graffitiPlugin));
         
         // Create a directory pointing to the subdirectory

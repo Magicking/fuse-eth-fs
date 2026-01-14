@@ -18,13 +18,25 @@ contract GraffitiPlugin is IFileSystem {
     using Strings for address;
 
     IGraffitiBaseNFT public immutable graffitiContract;
-    
+
     error NotImplemented();
     error InvalidStorageSlot();
     error TokenDoesNotExist();
+    error InvalidChainId();
 
-    constructor(address _graffitiContract) {
-        graffitiContract = IGraffitiBaseNFT(_graffitiContract);
+    constructor() {
+        uint256 chainId = block.chainid;
+        if (chainId == 8453) { // Base
+            graffitiContract = IGraffitiBaseNFT(0xCc39Fe145eECe8a733833D7A78dCa7f287996693);
+        } else if (chainId == 81457) { // Blast
+            graffitiContract = IGraffitiBaseNFT(0x971b2d96eFc3cffb8bAcE89A17AbfEd0b8743cD1);
+        } else if (chainId == 1301) { // Unichain
+            graffitiContract = IGraffitiBaseNFT(0x971b2d96eFc3cffb8bAcE89A17AbfEd0b8743cD1);
+        } else if (chainId == 59144) { // Linea
+            graffitiContract = IGraffitiBaseNFT(0xE6d6AacC26201AFf57a666090f789b15591a8e44);
+        } else {
+            revert InvalidChainId();
+        }
     }
 
     /**
@@ -163,7 +175,7 @@ contract GraffitiPlugin is IFileSystem {
     /**
      * @dev Get file name for a storage slot
      */
-    function _getFileName(uint256 storageSlot) private view returns (bytes memory) {
+    function _getFileName(uint256 storageSlot) private pure returns (bytes memory) {
         (uint256 tokenId, bool isJsonFile) = _parseStorageSlot(storageSlot);
         if (isJsonFile) {
             return bytes(string(abi.encodePacked(tokenId.toString(), ".json")));

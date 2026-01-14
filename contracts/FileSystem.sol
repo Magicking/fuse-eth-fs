@@ -49,18 +49,18 @@ contract FileSystem is IFileSystem {
     /**
      * @dev Get storage slot for entry metadata
      */
-    function _getMetadataSlot(uint256 storageSlot) private pure returns (uint256) {
+    function _getMetadataSlot(uint256 index) private pure returns (uint256) {
         // mapping(uint256 => uint256) entryMetadata; // slot 0
-        // slot = keccak256(abi.encodePacked(storageSlot, SLOT_ENTRY_METADATA))
-        return uint256(keccak256(abi.encodePacked(storageSlot, SLOT_ENTRY_METADATA)));
+        // slot = keccak256(abi.encodePacked(index, SLOT_ENTRY_METADATA))
+        return uint256(keccak256(abi.encodePacked(index, SLOT_ENTRY_METADATA)));
     }
     
     /**
      * @dev Get storage slot for directory target
      */
-    function _getDirectoryTargetSlot(uint256 storageSlot) private pure returns (uint256) {
+    function _getDirectoryTargetSlot(uint256 index) private pure returns (uint256) {
         // mapping(uint256 => address) directoryTargets; // slot 1
-        return uint256(keccak256(abi.encodePacked(storageSlot, SLOT_DIRECTORY_TARGETS)));
+        return uint256(keccak256(abi.encodePacked(index, SLOT_DIRECTORY_TARGETS)));
     }
     
     /**
@@ -68,10 +68,10 @@ contract FileSystem is IFileSystem {
      * File names are stored as bytes in a mapping
      * For names longer than 32 bytes, we use multiple slots
      */
-    function _getFileNameSlot(uint256 storageSlot, uint256 nameSlotIndex) private pure returns (uint256) {
+    function _getFileNameSlot(uint256 index, uint256 nameSlotIndex) private pure returns (uint256) {
         // mapping(uint256 => mapping(uint256 => bytes32)) fileNames; // slot 5
-        // First mapping: keccak256(abi.encodePacked(storageSlot, SLOT_FILE_NAMES))
-        uint256 firstMappingSlot = uint256(keccak256(abi.encodePacked(storageSlot, SLOT_FILE_NAMES)));
+        // First mapping: keccak256(abi.encodePacked(index, SLOT_FILE_NAMES))
+        uint256 firstMappingSlot = uint256(keccak256(abi.encodePacked(index, SLOT_FILE_NAMES)));
         // Second mapping: keccak256(abi.encodePacked(nameSlotIndex, firstMappingSlot))
         return uint256(keccak256(abi.encodePacked(nameSlotIndex, firstMappingSlot)));
     }
@@ -79,10 +79,10 @@ contract FileSystem is IFileSystem {
     /**
      * @dev Get storage slot for file cluster
      */
-    function _getClusterSlot(uint256 storageSlot, uint256 clusterIndex) private pure returns (uint256) {
+    function _getClusterSlot(uint256 index, uint256 clusterIndex) private pure returns (uint256) {
         // mapping(uint256 => mapping(uint256 => uint256)) fileClusters; // slot 2
-        // First mapping: keccak256(abi.encodePacked(storageSlot, SLOT_FILE_CLUSTERS))
-        uint256 firstMappingSlot = uint256(keccak256(abi.encodePacked(storageSlot, SLOT_FILE_CLUSTERS)));
+        // First mapping: keccak256(abi.encodePacked(index, SLOT_FILE_CLUSTERS))
+        uint256 firstMappingSlot = uint256(keccak256(abi.encodePacked(index, SLOT_FILE_CLUSTERS)));
         // Second mapping: keccak256(abi.encodePacked(clusterIndex, firstMappingSlot))
         return uint256(keccak256(abi.encodePacked(clusterIndex, firstMappingSlot)));
     }
@@ -92,8 +92,8 @@ contract FileSystem is IFileSystem {
      * mapping(uint256 => uint256) ownerAndGid; // base slot = OWNER_SLOT
      * Layout: owner (160 bits, bits 96-255) | gid (96 bits, bits 0-95)
      */
-    function _getOwnerSlot(uint256 storageSlot) private pure returns (uint256) {
-        return uint256(keccak256(abi.encodePacked(storageSlot, OWNER_SLOT)));
+    function _getOwnerSlot(uint256 index) private pure returns (uint256) {
+        return uint256(keccak256(abi.encodePacked(index, OWNER_SLOT)));
     }
     
     /**
@@ -115,7 +115,7 @@ contract FileSystem is IFileSystem {
     /**
      * @dev Load value from storage slot using Yul
      */
-    function _sload(uint256 slot) private view returns (uint256 value) {
+    function _sload(uint256 slot) internal view returns (uint256 value) {
         assembly {
             value := sload(slot)
         }

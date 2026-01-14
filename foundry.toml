@@ -12,4 +12,8 @@ fs_permissions = [
     { access = "write", path = "./deployment.json" }
 ]
 
+"remappings" = [
+  "@openzeppelin/=lib/openzeppelin-contracts"
+]
+
 # See more config options https://github.com/foundry-rs/foundry/tree/master/crates/config

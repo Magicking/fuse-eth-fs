@@ -2,8 +2,8 @@
 pragma solidity ^0.8.30;
 
 import "forge-std/Test.sol";
-import "../../../contracts/plugins/erc721/Graffiti.sol";
-import "../../../contracts/plugins/erc721/IGraffitiBaseNFT.sol";
+import "../../../contracts/plugins/graffiti/Graffiti.sol";
+import "../../../contracts/plugins/graffiti/IGraffitiBaseNFT.sol";
 import "../../../contracts/IFileSystem.sol";
 
 /**
@@ -25,6 +25,14 @@ contract MockGraffitiBaseNFT is IGraffitiBaseNFT {
     constructor(string memory _name) {
         name = _name;
         owner = msg.sender;
+        totalSupply = 0;
+    }
+    
+    // Helper to initialize contract after vm.etch (for testing)
+    function initialize(string memory _name, address _owner) external {
+        require(owner == address(0), "Already initialized");
+        name = _name;
+        owner = _owner;
         totalSupply = 0;
     }
     
@@ -91,8 +99,23 @@ contract GraffitiPluginTest is Test {
     address public colorOwner1;
     
     function setUp() public {
-        mockNFT = new MockGraffitiBaseNFT("Test Graffiti Collection");
-        plugin = new GraffitiPlugin(address(mockNFT));
+        // Set chainId to Base (8453) for testing
+        vm.chainId(8453);
+        
+        // Deploy mock NFT temporarily to get its bytecode
+        MockGraffitiBaseNFT tempMock = new MockGraffitiBaseNFT("Test Graffiti Collection");
+        
+        // Put mock contract code at the expected address for Base chain
+        address expectedAddress = address(0xCc39Fe145eECe8a733833D7A78dCa7f287996693);
+        bytes memory code = address(tempMock).code;
+        vm.etch(expectedAddress, code);
+        
+        // Initialize the contract at the expected address
+        mockNFT = MockGraffitiBaseNFT(expectedAddress);
+        mockNFT.initialize("Test Graffiti Collection", address(this));
+        
+        // Now create plugin (it will use the address based on chainId)
+        plugin = new GraffitiPlugin();
         
         user1 = address(0x1);
         user2 = address(0x2);
@@ -120,8 +143,20 @@ contract GraffitiPluginTest is Test {
     // ============ Constructor Tests ============
     
     function testConstructor() public {
-        GraffitiPlugin newPlugin = new GraffitiPlugin(address(mockNFT));
-        assertEq(address(newPlugin.graffitiContract()), address(mockNFT));
+        // Ensure chainId is set
+        vm.chainId(8453);
+        
+        // Deploy a temporary mock to get bytecode
+        MockGraffitiBaseNFT tempMock = new MockGraffitiBaseNFT("Test");
+        address expectedAddress = address(0xCc39Fe145eECe8a733833D7A78dCa7f287996693);
+        bytes memory code = address(tempMock).code;
+        vm.etch(expectedAddress, code);
+        
+        // Initialize the contract at expected address
+        MockGraffitiBaseNFT(expectedAddress).initialize("Test", address(this));
+        
+        GraffitiPlugin newPlugin = new GraffitiPlugin();
+        assertEq(address(newPlugin.graffitiContract()), expectedAddress);
     }
     
     // ============ Storage Slot Parsing Tests ============
@@ -293,9 +328,21 @@ contract GraffitiPluginTest is Test {
     }
     
     function testGetEntriesEmpty() public {
-        // Create a new mock with no tokens
-        MockGraffitiBaseNFT emptyMock = new MockGraffitiBaseNFT("Empty Collection");
-        GraffitiPlugin emptyPlugin = new GraffitiPlugin(address(emptyMock));
+        // Ensure chainId is set
+        vm.chainId(8453);
+        
+        // Create a temporary mock to get bytecode
+        MockGraffitiBaseNFT tempMock = new MockGraffitiBaseNFT("Empty Collection");
+        
+        // Put empty mock contract code at the expected address
+        address expectedAddress = address(0xCc39Fe145eECe8a733833D7A78dCa7f287996693);
+        bytes memory code = address(tempMock).code;
+        vm.etch(expectedAddress, code);
+        
+        // Initialize the contract at expected address
+        MockGraffitiBaseNFT(expectedAddress).initialize("Empty Collection", address(this));
+        
+        GraffitiPlugin emptyPlugin = new GraffitiPlugin();
         
         uint256[] memory entries = emptyPlugin.getEntries();
         assertEq(entries.length, 0);
