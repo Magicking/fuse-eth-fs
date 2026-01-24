@@ -611,10 +611,114 @@ contract FileSystem is IFileSystem {
     }
     
     /**
+     * @dev Get entry information at a specific storage slot with pagination support for body content
+     */
+    function getEntry(uint256 storageSlot, uint256 startingOffset, uint256 maximumLength) 
+        public 
+        view 
+        override
+        returns (
+            EntryType entryType,
+            address owner,
+            bytes memory name,
+            bytes memory body,
+            uint256 timestamp,
+            bool entryExists,
+            uint256 fileSize,
+            address directoryTarget
+        ) 
+    {
+        uint256 metadataSlot = _getMetadataSlot(storageSlot);
+        uint256 packed = _sload(metadataSlot);
+        (entryType, timestamp, fileSize) = _unpackMetadata(packed);
+        
+        // Existence is determined by timestamp > 0
+        entryExists = timestamp > 0;
+        
+        // Get owner from dedicated slot
+        uint256 ownerSlot = _getOwnerSlot(storageSlot);
+        (owner, ) = _unpackOwnerAndGid(_sload(ownerSlot));
+        
+        // Get directory target if it's a directory
+        if (entryExists && entryType == EntryType.DIRECTORY) {
+            uint256 targetSlot = _getDirectoryTargetSlot(storageSlot);
+            directoryTarget = address(uint160(_sload(targetSlot)));
+        }
+        
+        // Get name and body based on entry type
+        if (entryExists) {
+            if (entryType == EntryType.FILE) {
+                name = _readFileName(storageSlot, 256);
+                // Read body with pagination support
+                body = _readFromClusters(storageSlot, startingOffset, maximumLength, uint32(fileSize));
+            } else if (entryType == EntryType.DIRECTORY) {
+                name = _readFileName(storageSlot, 256);
+                body = new bytes(0);
+            } else {
+                name = new bytes(0);
+                body = new bytes(0);
+            }
+        } else {
+            name = new bytes(0);
+            body = new bytes(0);
+        }
+    }
+    
+    /**
      * @dev Get all storage slots that have entries in this filesystem
      */
     function getEntries() public view override returns (uint256[] memory) {
         return _getEntrySlots();
+    }
+    
+    /**
+     * @dev Get storage slots with pagination support
+     */
+    function getEntries(uint256 startingOffset, uint256 maximumLength) 
+        public 
+        view 
+        override
+        returns (uint256[] memory) 
+    {
+        uint256[] memory allSlots = _getEntrySlots();
+        uint256 totalCount = allSlots.length;
+        
+        // Handle out of bounds offset
+        if (startingOffset >= totalCount) {
+            return new uint256[](0);
+        }
+        
+        // Calculate actual length to return
+        uint256 remainingCount = totalCount - startingOffset;
+        uint256 actualLength = maximumLength;
+        if (maximumLength == 0 || maximumLength > remainingCount) {
+            actualLength = remainingCount;
+        }
+        
+        // Create result array and copy slots
+        uint256[] memory result = new uint256[](actualLength);
+        for (uint256 i = 0; i < actualLength; i++) {
+            result[i] = allSlots[startingOffset + i];
+        }
+        
+        return result;
+    }
+    
+    /**
+     * @dev Get the total count of entries in this filesystem
+     */
+    function getEntryCount() public view override returns (uint256) {
+        uint256 lengthSlot = SLOT_ENTRY_SLOTS;
+        return _sload(lengthSlot);
+    }
+    
+    /**
+     * @dev Get the size of a file at a specific storage slot
+     */
+    function getFileSize(uint256 storageSlot) public view override returns (uint256 fileSize) {
+        uint256 metadataSlot = _getMetadataSlot(storageSlot);
+        uint256 packed = _sload(metadataSlot);
+        (, , fileSize) = _unpackMetadata(packed);
     }
     
     /**

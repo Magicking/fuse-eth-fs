@@ -3,7 +3,7 @@ Unit tests for ContractManager
 """
 import unittest
 from unittest.mock import Mock, patch, MagicMock, call
-from fuse_eth_fs.contract_manager import ContractManager
+from fuse_eth_fs.contract_manager import ContractManager, FUNC_GET_ENTRY_PAGINATED, FUNC_GET_ENTRIES_PAGINATED
 
 
 class TestContractManager(unittest.TestCase):
@@ -209,6 +209,92 @@ class TestContractManager(unittest.TestCase):
         self.assertFalse(result)
         # Should not call exists if slot is not found
         self.mock_contract.functions.exists.assert_not_called()
+    
+    def test_get_entry_paginated_success(self):
+        """Test getting entry with pagination"""
+        # Mock _find_slot_by_path to return a slot
+        self.mock_contract.functions.getEntries.return_value.call.return_value = [0]
+        # Mock getEntry to return entry with matching name
+        self.mock_contract.functions.getEntry.return_value.call.return_value = (
+            0, '0xuser', b'test.txt', b'', 1234567890, True, 100, '0x0000000000000000000000000000000000000000'
+        )
+        
+        # Mock the paginated getEntry call - need to mock __getitem__ properly
+        mock_paginated_result = (
+            0, '0xuser', b'test.txt', b'Hello', 1234567890, True, 100, '0x0000000000000000000000000000000000000000'
+        )
+        mock_func_selector = Mock()
+        mock_func_selector.return_value.call.return_value = mock_paginated_result
+        self.mock_contract.functions.__getitem__ = Mock(return_value=mock_func_selector)
+        
+        result = self.manager.get_entry_paginated('0xuser', 'test.txt', 0, 5, any_owner=False)
+        
+        self.assertIsNotNone(result)
+        self.assertEqual(result[3], b'Hello')  # body at index 3
+        
+        # Verify the correct function was called
+        self.mock_contract.functions.__getitem__.assert_called_with(FUNC_GET_ENTRY_PAGINATED)
+    
+    def test_get_entries_paginated_success(self):
+        """Test getting entries with pagination"""
+        mock_slots = [3, 4, 5]
+        mock_func_selector = Mock()
+        mock_func_selector.return_value.call.return_value = mock_slots
+        self.mock_contract.functions.__getitem__ = Mock(return_value=mock_func_selector)
+        
+        result = self.manager.get_entries_paginated(2, 3)
+        
+        self.assertEqual(result, [3, 4, 5])
+        self.mock_contract.functions.__getitem__.assert_called_with(FUNC_GET_ENTRIES_PAGINATED)
+    
+    def test_get_entries_paginated_failure(self):
+        """Test getting entries with pagination when contract call fails"""
+        mock_func_selector = Mock()
+        mock_func_selector.return_value.call.side_effect = Exception("Call failed")
+        self.mock_contract.functions.__getitem__ = Mock(return_value=mock_func_selector)
+        
+        result = self.manager.get_entries_paginated(0, 10)
+        
+        self.assertEqual(result, [])
+    
+    def test_get_entry_count_success(self):
+        """Test getting entry count"""
+        self.mock_contract.functions.getEntryCount.return_value.call.return_value = 42
+        
+        result = self.manager.get_entry_count()
+        
+        self.assertEqual(result, 42)
+        self.mock_contract.functions.getEntryCount.assert_called_once()
+    
+    def test_get_entry_count_failure(self):
+        """Test getting entry count when contract call fails"""
+        self.mock_contract.functions.getEntryCount.return_value.call.side_effect = Exception("Call failed")
+        
+        result = self.manager.get_entry_count()
+        
+        self.assertEqual(result, 0)
+    
+    def test_get_file_size_success(self):
+        """Test getting file size"""
+        # Mock _find_slot_by_path to return a slot
+        self.mock_contract.functions.getEntries.return_value.call.return_value = [0]
+        self.mock_contract.functions.getEntry.return_value.call.return_value = (
+            0, '0xuser', b'test.txt', b'', 1234567890, True, 100, '0x0000000000000000000000000000000000000000'
+        )
+        self.mock_contract.functions.getFileSize.return_value.call.return_value = 1024
+        
+        result = self.manager.get_file_size('0xuser', 'test.txt', any_owner=False)
+        
+        self.assertEqual(result, 1024)
+    
+    def test_get_file_size_not_found(self):
+        """Test getting file size when file not found"""
+        # Mock _find_slot_by_path to return None
+        self.mock_contract.functions.getEntries.return_value.call.return_value = []
+        
+        result = self.manager.get_file_size('0xuser', 'nonexistent.txt')
+        
+        self.assertEqual(result, 0)
 
 
 if __name__ == '__main__':
