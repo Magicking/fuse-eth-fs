@@ -90,7 +90,21 @@ interface IFileSystem {
      * @return An array of all storage slot numbers with entries
      */
     function getEntries() external view returns (uint256[] memory);
-    
+
+    /**
+     * @dev Get the total number of entries in this filesystem
+     * @return The number of entries
+     */
+    function getEntryCount() external view returns (uint256);
+
+    /**
+     * @dev Get a paginated slice of storage slots that have entries
+     * @param offset The starting index (0-based)
+     * @param limit The maximum number of entries to return
+     * @return An array of storage slot numbers
+     */
+    function getEntriesPaginated(uint256 offset, uint256 limit) external view returns (uint256[] memory);
+
     /**
      * @dev Check if an entry exists at a specific storage slot
      * @param storageSlot The storage slot number

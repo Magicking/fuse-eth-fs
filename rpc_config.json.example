@@ -1,0 +1,10 @@
+{
+  "chains": {
+    "1337": {
+      "rpcs": ["http://127.0.0.1:8545", "http://127.0.0.1:8546"]
+    },
+    "1": {
+      "rpcs": ["https://eth-mainnet.example.com", "https://eth-backup.example.com"]
+    }
+  }
+}

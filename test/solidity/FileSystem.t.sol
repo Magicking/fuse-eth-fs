@@ -504,6 +504,84 @@ contract FileSystemTest is Test {
         assertEq(imagesEntries.length, 2); // 2 files
     }
     
+    function testGetEntryCount() public {
+        assertEq(fs.getEntryCount(), 0);
+
+        vm.startPrank(user1);
+        fs.createFile(bytes("file1.txt"), bytes("1"), 0);
+        assertEq(fs.getEntryCount(), 1);
+
+        fs.createFile(bytes("file2.txt"), bytes("2"), 0);
+        assertEq(fs.getEntryCount(), 2);
+
+        fs.createDirectory(bytes("dir1"), address(fs2));
+        assertEq(fs.getEntryCount(), 3);
+        vm.stopPrank();
+    }
+
+    function testGetEntriesPaginated() public {
+        vm.startPrank(user1);
+        fs.createFile(bytes("file1.txt"), bytes("1"), 0);
+        fs.createFile(bytes("file2.txt"), bytes("2"), 0);
+        fs.createFile(bytes("file3.txt"), bytes("3"), 0);
+        fs.createFile(bytes("file4.txt"), bytes("4"), 0);
+        fs.createFile(bytes("file5.txt"), bytes("5"), 0);
+        vm.stopPrank();
+
+        // Full list for reference
+        uint256[] memory all = fs.getEntries();
+        assertEq(all.length, 5);
+
+        // First page
+        uint256[] memory page1 = fs.getEntriesPaginated(0, 2);
+        assertEq(page1.length, 2);
+        assertEq(page1[0], all[0]);
+        assertEq(page1[1], all[1]);
+
+        // Second page
+        uint256[] memory page2 = fs.getEntriesPaginated(2, 2);
+        assertEq(page2.length, 2);
+        assertEq(page2[0], all[2]);
+        assertEq(page2[1], all[3]);
+
+        // Last page (partial)
+        uint256[] memory page3 = fs.getEntriesPaginated(4, 2);
+        assertEq(page3.length, 1);
+        assertEq(page3[0], all[4]);
+
+        // Offset beyond total
+        uint256[] memory empty = fs.getEntriesPaginated(10, 5);
+        assertEq(empty.length, 0);
+
+        // Limit larger than remaining
+        uint256[] memory large = fs.getEntriesPaginated(3, 100);
+        assertEq(large.length, 2);
+        assertEq(large[0], all[3]);
+        assertEq(large[1], all[4]);
+
+        // Single entry
+        uint256[] memory single = fs.getEntriesPaginated(2, 1);
+        assertEq(single.length, 1);
+        assertEq(single[0], all[2]);
+    }
+
+    function testGetEntriesPaginatedEmpty() public {
+        uint256[] memory empty = fs.getEntriesPaginated(0, 10);
+        assertEq(empty.length, 0);
+    }
+
+    function testGetEntryCountAfterDelete() public {
+        vm.startPrank(user1);
+        fs.createFile(bytes("file1.txt"), bytes("1"), 0);
+        fs.createFile(bytes("file2.txt"), bytes("2"), 0);
+        assertEq(fs.getEntryCount(), 2);
+
+        uint256[] memory entries = fs.getEntries();
+        fs.deleteEntry(entries[0]);
+        assertEq(fs.getEntryCount(), 1);
+        vm.stopPrank();
+    }
+
     function displayRecursive(FileSystem filesystem, string memory prefix, uint256 depth) internal view {
         uint256[] memory entries = filesystem.getEntries();
         

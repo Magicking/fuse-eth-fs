@@ -52,14 +52,14 @@ class EthFS(LoggingMixIn, Operations):
                 logger.warning(f"Failed to load account from PRIVATE_KEY: {e}")
                 logger.warning("Transactions will fail if PRIVATE_KEY is not set correctly")
         
-        # Initialize contract managers for each chain
+        # Initialize contract managers for each chain (passing full pool)
         self.contract_managers: Dict[int, ContractManager] = {}
         for chain_id, address in contract_addresses.items():
-            w3 = self.rpc_manager.get_connection(chain_id)
-            if w3 is None:
+            w3_pool = self.rpc_manager.get_all_connections(chain_id)
+            if not w3_pool:
                 logger.warning(f"Could not connect to chain {chain_id}, skipping")
                 continue
-            self.contract_managers[chain_id] = ContractManager(w3, address, transaction_account=self.transaction_account)
+            self.contract_managers[chain_id] = ContractManager(w3_pool, address, transaction_account=self.transaction_account)
         
         # Cache for directory listings and file metadata
         # Maps (chain_id, account, path) -> entry_info
@@ -105,38 +105,33 @@ class EthFS(LoggingMixIn, Operations):
         return (chain_id, account, relative_path)
     
     def _refresh_cache(self):
-        """Refresh the cache by querying all entries from contracts"""
+        """Refresh the cache by querying all entries from contracts using parallel fetching"""
         self.entry_cache.clear()
         self.slot_cache.clear()
-        
+
         for chain_id, contract_manager in self.contract_managers.items():
             try:
-                # Get all storage slots
-                slots = contract_manager.contract.functions.getEntries().call()
-                
-                for slot in slots:
+                # Collect all slots via paginated iteration
+                all_slots = list(contract_manager.iter_entries(page_size=50))
+
+                # Fetch entries in parallel across the RPC pool
+                entries = contract_manager.parallel_get_entries(all_slots)
+
+                for slot, entry in entries.items():
                     try:
-                        entry = contract_manager.contract.functions.getEntry(slot).call()
                         entry_type, owner, name_bytes, body, timestamp, exists, file_size, dir_target = entry
-                        
+
                         if not exists:
                             continue
-                        
+
                         owner_lower = owner.lower()
-                        # Store slot for all accounts (world-readable)
-                        # We still track by owner for organizational purposes, but don't filter by it
                         if (chain_id, owner_lower) not in self.slot_cache:
                             self.slot_cache[(chain_id, owner_lower)] = set()
                         self.slot_cache[(chain_id, owner_lower)].add(slot)
-                        
-                        # Build path from entry name (which stores the full path)
-                        # Both files and directories now store their names
+
                         if name_bytes:
                             try:
                                 full_path = name_bytes.decode('utf-8')
-                                # Store entry info with full path for the owner
-                                # Also store it for any account that might access it (world-readable)
-                                # For now, we'll store it under the owner's key but allow access from any account
                                 self.entry_cache[(chain_id, owner_lower, full_path)] = {
                                     'slot': slot,
                                     'type': entry_type,
@@ -388,13 +383,13 @@ class EthFS(LoggingMixIn, Operations):
         if cache_key in self._contract_manager_cache:
             return self._contract_manager_cache[cache_key]
         
-        # Create a new contract manager for this address
-        w3 = self.rpc_manager.get_connection(chain_id)
-        if w3 is None:
+        # Create a new contract manager for this address (pass full pool)
+        w3_pool = self.rpc_manager.get_all_connections(chain_id)
+        if not w3_pool:
             return self.contract_managers[chain_id]  # Fallback to default
-        
+
         try:
-            new_manager = ContractManager(w3, contract_address, transaction_account=self.transaction_account)
+            new_manager = ContractManager(w3_pool, contract_address, transaction_account=self.transaction_account)
             self._contract_manager_cache[cache_key] = new_manager
             return new_manager
         except Exception as e:
@@ -414,37 +409,28 @@ class EthFS(LoggingMixIn, Operations):
                 contract_manager = self._get_contract_manager(chain_id, account, path)
                 if contract_manager is None:
                     return []
-                
+
                 try:
-                    slots = contract_manager.contract.functions.getEntries().call()
-                    for slot in slots:
-                        try:
-                            entry = contract_manager.contract.functions.getEntry(slot).call()
-                            entry_type, owner, name_bytes, body, timestamp, exists, file_size, dir_target = entry
-                            
-                            # World-readable: show all entries regardless of owner
-                            if exists:
-                                if name_bytes:
-                                    try:
-                                        entry_name = name_bytes.decode('utf-8')
-                                        # In subdirectory contracts, entries are stored with relative paths
-                                        # When listing the root of a subdirectory contract, show all top-level entries
-                                        if '/' in entry_name:
-                                            # Entry is in a subdirectory, get the first component
-                                            first_part = entry_name.split('/')[0]
-                                            entries.add(first_part)
-                                        else:
-                                            # Entry is at root level
-                                            entries.add(entry_name)
-                                    except UnicodeDecodeError:
-                                        pass
-                        except Exception:
-                            continue
+                    all_slots = list(contract_manager.iter_entries(page_size=50))
+                    fetched = contract_manager.parallel_get_entries(all_slots)
+
+                    for slot, entry_data in fetched.items():
+                        entry_type, owner, name_bytes, body, timestamp, exists, file_size, dir_target = entry_data
+                        if exists and name_bytes:
+                            try:
+                                entry_name = name_bytes.decode('utf-8')
+                                if '/' in entry_name:
+                                    first_part = entry_name.split('/')[0]
+                                    entries.add(first_part)
+                                else:
+                                    entries.add(entry_name)
+                            except UnicodeDecodeError:
+                                pass
                     return sorted(list(entries))
                 except Exception as e:
                     logger.debug(f"Error listing directory from subdirectory contract: {e}")
                     return []
-        
+
         # Get the contract manager for this path (may be different if parent has directoryTarget)
         contract_manager = self._get_contract_manager(chain_id, account, path)
         if contract_manager is None:
@@ -459,45 +445,31 @@ class EthFS(LoggingMixIn, Operations):
         default_address = self.contract_addresses.get(chain_id)
         if contract_address.lower() != default_address.lower():
             # We're using a subdirectory contract, query it directly
-            # Get relative path within the subdirectory contract
             relative_path = self._get_relative_path_in_subdirectory(chain_id, account, path)
-            
+
             try:
-                slots = contract_manager.contract.functions.getEntries().call()
-                for slot in slots:
-                    try:
-                        entry = contract_manager.contract.functions.getEntry(slot).call()
-                        entry_type, owner, name_bytes, body, timestamp, exists, file_size, dir_target = entry
-                        
-                        # World-readable: show all entries regardless of owner
-                        if exists:
-                            if name_bytes:
-                                try:
-                                    entry_name = name_bytes.decode('utf-8')
-                                    # In subdirectory contracts, entries are stored with relative paths
-                                    # If relative_path is empty (listing root of subdirectory contract), show all top-level entries
-                                    if not relative_path:
-                                        # Get the first component of the path
-                                        if '/' in entry_name:
-                                            first_part = entry_name.split('/')[0]
-                                            entries.add(first_part)
-                                        else:
-                                            entries.add(entry_name)
-                                    else:
-                                        # We're listing a subdirectory within the subdirectory contract
-                                        # Check if entry is in this subdirectory
-                                        if entry_name.startswith(relative_path + '/'):
-                                            remaining = entry_name[len(relative_path + '/'):]
-                                            if remaining:
-                                                next_part = remaining.split('/')[0]
-                                                entries.add(next_part)
-                                        elif entry_name == relative_path:
-                                            # This is the directory itself, skip it
-                                            pass
-                                except UnicodeDecodeError:
-                                    pass
-                    except Exception:
-                        continue
+                all_slots = list(contract_manager.iter_entries(page_size=50))
+                fetched = contract_manager.parallel_get_entries(all_slots)
+
+                for slot, entry_data in fetched.items():
+                    entry_type, owner, name_bytes, body, timestamp, exists, file_size, dir_target = entry_data
+                    if exists and name_bytes:
+                        try:
+                            entry_name = name_bytes.decode('utf-8')
+                            if not relative_path:
+                                if '/' in entry_name:
+                                    first_part = entry_name.split('/')[0]
+                                    entries.add(first_part)
+                                else:
+                                    entries.add(entry_name)
+                            else:
+                                if entry_name.startswith(relative_path + '/'):
+                                    remaining = entry_name[len(relative_path + '/'):]
+                                    if remaining:
+                                        next_part = remaining.split('/')[0]
+                                        entries.add(next_part)
+                        except UnicodeDecodeError:
+                            pass
                 return sorted(list(entries))
             except Exception as e:
                 logger.debug(f"Error listing directory from subdirectory contract: {e}")

@@ -278,6 +278,28 @@ contract GraffitiPlugin is IFileSystem {
         return entries;
     }
 
+    function getEntryCount() external view override returns (uint256) {
+        return graffitiContract.totalSupply() * 2;
+    }
+
+    function getEntriesPaginated(uint256 offset, uint256 limit) external view override returns (uint256[] memory) {
+        uint256 total = graffitiContract.totalSupply() * 2;
+
+        if (offset >= total) {
+            return new uint256[](0);
+        }
+
+        uint256 remaining = total - offset;
+        uint256 count = limit < remaining ? limit : remaining;
+        uint256[] memory entries = new uint256[](count);
+
+        for (uint256 i = 0; i < count; i++) {
+            entries[i] = offset + i;
+        }
+
+        return entries;
+    }
+
     function exists(uint256 storageSlot) external view override returns (bool) {
         (uint256 tokenId, ) = _parseStorageSlot(storageSlot);
         return _tokenExists(tokenId);

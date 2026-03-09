@@ -616,7 +616,37 @@ contract FileSystem is IFileSystem {
     function getEntries() public view override returns (uint256[] memory) {
         return _getEntrySlots();
     }
-    
+
+    /**
+     * @dev Get the total number of entries in this filesystem
+     */
+    function getEntryCount() public view override returns (uint256) {
+        return _sload(SLOT_ENTRY_SLOTS);
+    }
+
+    /**
+     * @dev Get a paginated slice of storage slots that have entries
+     */
+    function getEntriesPaginated(uint256 offset, uint256 limit) public view override returns (uint256[] memory) {
+        uint256 lengthSlot = SLOT_ENTRY_SLOTS;
+        uint256 total = _sload(lengthSlot);
+
+        if (offset >= total) {
+            return new uint256[](0);
+        }
+
+        uint256 remaining = total - offset;
+        uint256 count = limit < remaining ? limit : remaining;
+        uint256[] memory slots = new uint256[](count);
+        uint256 baseSlot = uint256(keccak256(abi.encodePacked(lengthSlot)));
+
+        for (uint256 i = 0; i < count; i++) {
+            slots[i] = _sload(baseSlot + offset + i);
+        }
+
+        return slots;
+    }
+
     /**
      * @dev Check if an entry exists at a specific storage slot
      */
