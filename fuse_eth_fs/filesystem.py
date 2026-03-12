@@ -648,11 +648,26 @@ class EthFS(LoggingMixIn, Operations):
             }
         else:
             st_mode = stat.S_IFREG | 0o644
-        
+
+        file_size = entry_info.get('size', 0)
+
+        # For RPC proxy plugins, the on-chain fileSize is 0 (dynamic).
+        # Fetch the full content to determine the actual size.
+        if file_size == 0 and entry_info['type'] == ENTRY_TYPE_FILE:
+            contract_manager = self._get_contract_manager(chain_id, account, rel_path)
+            if contract_manager is not None and contract_manager.is_rpc_proxy_plugin():
+                slot = entry_info.get('slot')
+                if slot is not None:
+                    content = contract_manager.rpc_proxy_manager.read_proxy_file(
+                        contract_manager._get_contract(), slot
+                    )
+                    if content is not None:
+                        file_size = len(content)
+
         return {
             'st_mode': st_mode,
             'st_nlink': 1,
-            'st_size': entry_info.get('size', 0),
+            'st_size': file_size,
             'st_ctime': entry_info.get('timestamp', time.time()),
             'st_mtime': entry_info.get('timestamp', time.time()),
             'st_atime': time.time(),

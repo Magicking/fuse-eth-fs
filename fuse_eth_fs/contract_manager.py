@@ -9,6 +9,8 @@ from web3 import Web3
 from web3.contract import Contract
 from eth_account import Account
 
+from .rpc_proxy import RPCProxyManager, RPC_PROXY_ABI
+
 logger = logging.getLogger(__name__)
 
 # Default ABI matching IFileSystem.sol interface
@@ -159,19 +161,25 @@ class ContractManager:
         else:
             abi = DEFAULT_ABI
 
-        self._abi = abi
+        # Merge RPC proxy ABI entries so contracts can be queried for proxy methods
+        merged_abi = list(abi) + RPC_PROXY_ABI
+        self._abi = merged_abi
 
         # Create contract instances for each Web3 in the pool
         self.contracts: List[Contract] = []
         for w3_instance in self._w3_pool:
             self.contracts.append(w3_instance.eth.contract(
                 address=self.contract_address,
-                abi=abi
+                abi=merged_abi
             ))
 
         # Primary Web3/contract for writes (first in pool)
         self.w3 = self._w3_pool[0]
         self.contract: Contract = self.contracts[0]
+
+        # RPC proxy manager (lazy: detection is cached per address)
+        self.rpc_proxy_manager = RPCProxyManager(self._w3_pool)
+        self._is_rpc_proxy: Optional[bool] = None
 
     def _get_contract(self) -> Contract:
         """Get a contract instance via round-robin for read operations"""
@@ -188,6 +196,12 @@ class ContractManager:
     def pool_size(self) -> int:
         """Number of Web3/contract instances in the pool"""
         return len(self.contracts)
+
+    def is_rpc_proxy_plugin(self) -> bool:
+        """Check if this contract is an RPC proxy plugin (result is cached)."""
+        if self._is_rpc_proxy is None:
+            self._is_rpc_proxy = self.rpc_proxy_manager.is_rpc_proxy(self.contract)
+        return self._is_rpc_proxy
 
     def _send_transaction(self, function_call, tx_params: dict) -> str:
         """
@@ -489,6 +503,18 @@ class ContractManager:
             storage_slot = self._find_slot_by_path(account, path, any_owner=True)
             if storage_slot is None:
                 return None
+
+            if self.is_rpc_proxy_plugin():
+                # Two-phase RPC proxy read
+                full_content = self.rpc_proxy_manager.read_proxy_file(
+                    self._get_contract(), storage_slot
+                )
+                if full_content is None:
+                    return None
+                if length:
+                    return full_content[offset:offset + length]
+                return full_content[offset:]
+
             contract = self._get_contract()
             result = contract.functions.readFile(storage_slot, offset, length).call()
             return result
