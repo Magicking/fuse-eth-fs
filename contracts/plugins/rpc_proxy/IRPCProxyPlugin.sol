@@ -11,7 +11,7 @@ import {IFileSystem} from "../../IFileSystem.sol";
  * produce human-readable file content.
  */
 interface IRPCProxyPlugin is IFileSystem {
-    enum RPCCallType { STORAGE_AT, CALL, GET_CODE, GAS_PRICE, BLOCK_NUMBER, GET_BALANCE }
+    enum RPCCallType { STORAGE_AT, CALL, GET_CODE, GAS_PRICE, BLOCK_NUMBER, GET_BALANCE, BATCH_CALL }
 
     struct RPCDescriptor {
         RPCCallType callType;

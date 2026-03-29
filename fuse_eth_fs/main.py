@@ -37,7 +37,12 @@ def main():
         action='store_true',
         help='Enable debug output'
     )
-    
+    parser.add_argument(
+        '--allow-other',
+        action='store_true',
+        help='Allow other users to access the filesystem (requires user_allow_other in /etc/fuse.conf)'
+    )
+
     args = parser.parse_args()
     
     # Parse contract addresses
@@ -86,7 +91,7 @@ def main():
     
     fuse_options = {
         'foreground': args.foreground or args.debug,
-        'allow_other': False,
+        'allow_other': args.allow_other,
         'auto_unmount': True,
     }
     

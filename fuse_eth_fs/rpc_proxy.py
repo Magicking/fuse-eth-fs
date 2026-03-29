@@ -22,6 +22,7 @@ RPC_CALL_TYPE_GET_CODE = 2
 RPC_CALL_TYPE_GAS_PRICE = 3
 RPC_CALL_TYPE_BLOCK_NUMBER = 4
 RPC_CALL_TYPE_GET_BALANCE = 5
+RPC_CALL_TYPE_BATCH_CALL = 6
 
 # ABI entries for the IRPCProxyPlugin extension functions
 RPC_PROXY_ABI = [
@@ -183,6 +184,17 @@ class RPCProxyManager:
             elif call_type == RPC_CALL_TYPE_GET_BALANCE:
                 result = w3.eth.get_balance(target_address, block_id)
                 return result.to_bytes(32, "big")
+
+            elif call_type == RPC_CALL_TYPE_BATCH_CALL:
+                # callData = abi.encode(address[] targets, bytes[] calldatas)
+                # Returns abi.encode(bytes[] results)
+                from eth_abi import decode as abi_decode, encode as abi_encode
+                targets, calldatas = abi_decode(["address[]", "bytes[]"], call_data)
+                results = [
+                    bytes(w3.eth.call({"to": t, "data": bytes(cd)}, block_id))
+                    for t, cd in zip(targets, calldatas)
+                ]
+                return abi_encode(["bytes[]"], [results])
 
             else:
                 logger.error(f"Unknown RPC call type: {call_type}")
